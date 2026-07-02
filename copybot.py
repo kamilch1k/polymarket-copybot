@@ -19,10 +19,13 @@ RUN
   python copybot.py --check     offline self-check
   python copybot.py             start app; browser opens; configure in the page
 """
+import html
 import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -54,6 +57,7 @@ DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 WS_URL = "wss://ws-live-data.polymarket.com"  # real-time platform activity stream
+CLAUDE_MODEL = "claude-opus-4-8"  # runs on the owner's Claude CLI login (Max plan)
 # -----------------------------------------------------------------------------
 
 LOCK = threading.Lock()
@@ -67,6 +71,8 @@ STATE = {
     "history": [],               # every executed copy, persisted
     "ws": False,                 # realtime feed connected?
     "wallet": {},                # on-chain truth: usdc cash + open positions
+    "chat": deque(maxlen=30),    # conversation with the in-bot Claude copilot
+    "thinking": False,           # a Claude request is in flight
 }
 
 
@@ -455,6 +461,150 @@ def try_go_live(source):
         logline(kind="error", note=f"auto-live failed ({source}): {str(ex)[:120]}")
 
 
+# ---- claude copilot ----------------------------------------------------------
+def bot_context():
+    """Compact live snapshot handed to Claude so it can explain what's going on."""
+    with LOCK:
+        holdings = [{"market": STATE["names"].get(k, k[:14]), "shares": v}
+                    for k, v in STATE["holdings"].items() if v > 0]
+        log = [{k: e.get(k) for k in ("t", "kind", "side", "name", "shares", "price", "note")}
+               for e in list(STATE["log"])[:12]]
+        drifts = [e["drift"] for e in STATE["history"] if e.get("drift") is not None]
+        w = STATE["wallet"]
+        ctx = {
+            "live_trading": STATE["live"], "mode": MODE, "ws_realtime": STATE["ws"],
+            "targets": [{"addr": a, "name": STATE["tnames"].get(a, "?")} for a in TARGETS],
+            "settings": {"copy_fraction": COPY_FRACTION, "max_usd_per_trade": MAX_USDC_PER_TRADE,
+                         "min_his_buy_usd": MIN_HIS_NOTIONAL, "slippage": SLIPPAGE,
+                         "bankroll_usd": BANKROLL},
+            "bot_holdings": holdings,
+            "pending_approvals": len(STATE["pending"]),
+            "wallet_usdc_cash": w.get("usdc"),
+            "wallet_positions_value": round(sum(float(p.get("currentValue") or 0)
+                                                for p in w.get("positions", [])), 2),
+            "copies_made": STATE["copies"],
+            "avg_copy_lag_cost_cents": round(sum(drifts) / len(drifts), 2) if drifts else None,
+            "recent_activity_log": log,
+        }
+    return ctx
+
+
+ALLOWED_OPS = ("live", "mode", "fraction", "cap", "min_his", "slippage",
+               "bankroll", "add_target", "drop_target")
+
+
+def parse_actions(text):
+    """Split Claude's reply from its trailing 'ACTIONS: [...]' control line."""
+    acts, keep = [], []
+    for line in text.splitlines():
+        if line.strip().startswith("ACTIONS:"):
+            try:
+                acts = json.loads(line.strip()[len("ACTIONS:"):].strip())
+            except ValueError:
+                pass
+        else:
+            keep.append(line)
+    return "\n".join(keep).strip(), (acts if isinstance(acts, list) else [])
+
+
+def apply_actions(acts):
+    """Whitelisted bot controls Claude may invoke when the owner asks for a change."""
+    global MODE, COPY_FRACTION, MAX_USDC_PER_TRADE, MIN_HIS_NOTIONAL, SLIPPAGE, BANKROLL
+    applied = []
+    for a in acts[:6]:
+        if not isinstance(a, dict) or a.get("op") not in ALLOWED_OPS:
+            continue
+        op, v = a["op"], a.get("value")
+        try:
+            if op == "live":
+                if v:
+                    try_go_live("claude copilot")
+                    applied.append("live ON" if STATE["live"] else "live requested (check status)")
+                else:
+                    with LOCK:
+                        STATE["live"] = False
+                    applied.append("live OFF")
+            elif op == "mode" and v in ("auto", "approve"):
+                MODE = v
+                applied.append(f"mode={v}")
+            elif op in ("fraction", "cap", "min_his", "slippage", "bankroll"):
+                v = float(v)
+                if op == "fraction":
+                    COPY_FRACTION = v
+                elif op == "cap":
+                    MAX_USDC_PER_TRADE = v
+                elif op == "min_his":
+                    MIN_HIS_NOTIONAL = v
+                elif op == "slippage":
+                    SLIPPAGE = v
+                else:
+                    BANKROLL = v
+                applied.append(f"{op}={v:g}")
+            elif op == "add_target" and valid_addr(str(v)) and v not in TARGETS:
+                TARGETS.append(v)
+                with LOCK:
+                    STATE["baselined"].discard(v)
+                applied.append(f"added target {str(v)[:8]}…")
+            elif op == "drop_target" and v in TARGETS:
+                TARGETS.remove(v)
+                applied.append(f"dropped target {str(v)[:8]}…")
+        except (TypeError, ValueError):
+            continue
+    if applied:
+        save_config()
+        logline(kind="skip", note="claude copilot: " + ", ".join(applied))
+    return applied
+
+
+def ask_claude(q):
+    with LOCK:
+        STATE["thinking"] = True
+        history = "\n".join(f"{m['who']}: {m['text'][:400]}" for m in list(STATE["chat"])[-6:])
+        STATE["chat"].append({"who": "you", "text": q})
+    try:
+        exe = shutil.which("claude")
+        if not exe:
+            raise RuntimeError("claude CLI not found on PATH — install Claude Code or add it to PATH")
+        prompt = f"""You are the copilot living inside the owner's Polymarket copy-trading bot (single user, their own machine, their own $30 account). You see the bot's live state below. Answer the owner plainly in a few short sentences: explain what the bot is doing, why trades/skips happened, what settings mean, or advise. Be concrete, use the numbers.
+
+CURRENT BOT STATE (live):
+{json.dumps(bot_context(), ensure_ascii=False)}
+
+RECENT CONVERSATION:
+{history or "(none)"}
+
+You can control the bot. If — and only if — the owner asks for a change, end your reply with one final line:
+ACTIONS: [{{"op": "...", "value": ...}}]
+Allowed ops: live (true/false) · mode ("auto"/"approve") · fraction (number) · cap ($) · min_his ($) · slippage (0-1) · bankroll ($) · add_target ("0x...") · drop_target ("0x...").
+If no change was requested, end with exactly: ACTIONS: []
+
+OWNER: {q}"""
+        # scrub inherited session vars so the CLI always uses the owner's own login
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("ANTHROPIC", "CLAUDE"))}
+        r = subprocess.run([exe, "-p", prompt, "--model", CLAUDE_MODEL],
+                           capture_output=True, text=True, timeout=240,
+                           encoding="utf-8", errors="replace", env=env)
+        out = (r.stdout or "").strip()
+        if not out:
+            out = f"(claude cli gave no output: {(r.stderr or 'unknown error')[:200]})"
+        reply, acts = parse_actions(out)
+        applied = apply_actions(acts)
+        if applied:
+            reply += ("\n\n⚙ applied: " + ", ".join(applied))
+        with LOCK:
+            STATE["chat"].append({"who": "claude", "text": reply or "(empty reply)"})
+    except subprocess.TimeoutExpired:
+        with LOCK:
+            STATE["chat"].append({"who": "claude", "text": "(timed out after 240s — try again)"})
+    except Exception as ex:
+        with LOCK:
+            STATE["chat"].append({"who": "claude", "text": f"(error: {str(ex)[:200]})"})
+    finally:
+        with LOCK:
+            STATE["thinking"] = False
+
+
 def ws_loop():
     """Real-time path: stream every platform trade, act on our targets' ones
     in <1s instead of waiting for the next poll. REST polling stays running
@@ -612,6 +762,24 @@ def _history_rows():
                 f'<td>{e.get("name", "")}</td><td class=r>{e.get("shares", "")} @ {e.get("price", "")}</td>'
                 f'<td class=dim>{e.get("note", "")}</td></tr>')
     return out or "<tr><td colspan=6 class=dim>no trades yet</td></tr>"
+
+
+def _chat_card():
+    with LOCK:
+        chat = list(STATE["chat"])
+        thinking = STATE["thinking"]
+    if not chat and not thinking:
+        return ""
+    rows = ""
+    for m in chat:
+        who_col = "#a78bfa" if m["who"] == "claude" else "#6b7280"
+        body = html.escape(m["text"]).replace("\n", "<br>")
+        rows += (f'<div style="margin:6px 0"><span style="color:{who_col};font-weight:700">'
+                 f'{"🤖 claude" if m["who"] == "claude" else "you"}</span> '
+                 f'<span>{body}</span></div>')
+    if thinking:
+        rows += '<div class=dim>🤖 claude (opus 4.8) is thinking…</div>'
+    return f'<h2>Claude copilot</h2><div class=card>{rows}</div>'
 
 
 def _wallet_card():
@@ -799,6 +967,7 @@ def render_dyn():
   <form method=post action=/kill style=display:inline onsubmit="return confirm('Kill the bot?')"><button class=kill>Kill</button></form>
 </div>
 {errbar}
+{_chat_card()}
 {_status_card()}
 {_pending_card()}
 {_wallet_card()}
@@ -854,6 +1023,11 @@ details.cfg summary{{cursor:pointer;font-weight:700}}
 </style></head><body>
 <h1>Polymarket copybot <span class=dim style=font-weight:400>build {BUILD}</span></h1>
 {_settings_form()}
+<form method=post action=/ask style="display:flex;gap:8px;margin-bottom:14px">
+  <input name=q autocomplete=off placeholder="Ask Claude anything about the bot — or tell it to change settings, switch modes, go live/dry…"
+         style="flex:1;background:#0f1523;border:1px solid #334155;border-radius:8px;color:#e5e7eb;padding:8px 10px;font:inherit">
+  <button class=copy>Ask Claude</button>
+</form>
 <div id=dyn>{render_dyn()}</div>
 <script>
 // instant paste feedback: green the moment the value looks right, red + reason
@@ -964,6 +1138,10 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["conn"] = (False, str(ex)[:160])
         elif path == "/testtrade":
             threading.Thread(target=test_trade, daemon=True).start()
+        elif path == "/ask":
+            q = f.get("q", [""])[0].strip()
+            if q and not STATE["thinking"]:
+                threading.Thread(target=ask_claude, args=(q,), daemon=True).start()
         elif path == "/approve":
             pid = f.get("id", [""])[0]
             with LOCK:
@@ -1027,6 +1205,9 @@ class Handler(BaseHTTPRequestHandler):
 
 # ---- entry ------------------------------------------------------------------
 def _check():
+    # never touch the real config/state during self-checks (they hold live creds)
+    globals()["CONFIG_FILE"] = Path(os.environ.get("TEMP", ".")) / "copybot_check_config.json"
+    globals()["STATE_FILE"] = Path(os.environ.get("TEMP", ".")) / "copybot_check_state.json"
     globals()["midpoint"] = lambda tid: None  # offline: no live mid / tick lookups
     globals()["tick_of"] = lambda tid: 0.01
     assert my_buy_size(1000, 0.50, 0.01, 50) == 10.0
@@ -1071,8 +1252,18 @@ def _check():
     assert valid_addr(a1) and not valid_addr("0xZZ") and not valid_addr("")
     assert key_wallet("0x" + "11" * 32).startswith("0x")  # any 32-byte scalar is a key
     assert key_wallet("junk") == "" and key_wallet("") == ""
-    html = render()
-    assert "copybot" in html and "Settings" in html and "leaderboard" in html and "Trade history" in html
+    # claude copilot: action-line parsing + whitelisted application
+    reply, acts = parse_actions('The bot is fine.\nACTIONS: [{"op":"mode","value":"approve"},{"op":"cap","value":3}]')
+    assert reply == "The bot is fine." and len(acts) == 2
+    assert set(apply_actions(acts)) == {"mode=approve", "cap=3"}
+    assert MODE == "approve" and MAX_USDC_PER_TRADE == 3.0
+    MODE, globals()["MAX_USDC_PER_TRADE"] = "auto", 5.0
+    assert apply_actions([{"op": "rm -rf", "value": 1}, "junk"]) == []  # non-whitelisted ignored
+    assert parse_actions("no control line at all")[1] == []
+    assert json.dumps(bot_context())  # snapshot is JSON-serializable
+    page = render()
+    assert "copybot" in page and "Settings" in page and "leaderboard" in page and "Trade history" in page
+    assert "Ask Claude" in page and "action=/ask" in page
     dyn = render_dyn()
     assert "Status" in dyn and "Test connection" in dyn and "❌" in dyn  # unconfigured -> red rows
     assert "Your wallet" in dyn and "no open positions on-chain" in dyn
