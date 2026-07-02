@@ -1039,8 +1039,12 @@ def render_dyn():
         log = list(STATE["log"])
     up = int(time.time() - started)
     age = "never" if not last else f"{int(time.time() - last)}s ago"
-    pill = ('<span style="background:#166534;color:#4ade80">● LIVE</span>' if live
-            else '<span style="background:#374151;color:#93c5fd">◦ DRY (watch-only)</span>')
+    if not live:
+        pill = '<span style="background:#374151;color:#93c5fd">◦ DRY — watch only, no trades</span>'
+    elif MODE == "auto":
+        pill = '<span style="background:#166534;color:#4ade80">● LIVE · AUTO — copying trades now</span>'
+    else:
+        pill = '<span style="background:#7c5e00;color:#fbbf24">● LIVE · APPROVE — waiting for your ✓ (nothing trades unattended)</span>'
     if live:
         toggle = '<form method=post action=/dry style=display:inline><button class=dry>Go DRY</button></form>'
     elif ready():
