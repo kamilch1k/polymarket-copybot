@@ -48,7 +48,7 @@ MIN_HIS_NOTIONAL = 50.0       # copy his BUY only if he put >= this many $ in (s
 MODE = "auto"                 # "auto" = copy instantly · "approve" = queue for your click
 POLL_SECONDS = 15             # REST polling is the fallback; WebSocket is the fast path
 LEADERS_EVERY = 20            # refresh leaderboard every N polls (~5 min)
-SIGNATURE_TYPE = 1            # 1 = email/magic login, 2 = browser wallet
+SIGNATURE_TYPE = 3            # 1 = old email/magic · 2 = browser wallet · 3 = new Polymarket wallet (2026+). Auto-detected.
 PORT = 8777
 PRIVATE_KEY_MEM = None        # persisted to config by owner's choice (single-user PC)
 CONFIG_FILE = Path(__file__).with_name("copybot_config.json")
@@ -59,7 +59,8 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 WS_URL = "wss://ws-live-data.polymarket.com"  # real-time platform activity stream
 CLAUDE_MODEL = "claude-opus-4-8"  # runs on the owner's Claude CLI login (Max plan)
-USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # Polymarket collateral (bridged USDC.e on Polygon)
+USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # legacy collateral (bridged USDC.e on Polygon)
+PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"    # pUSD — Polymarket collateral since the 2026-04-28 V2 upgrade
 POLYGON_RPCS = ["https://polygon-bor-rpc.publicnode.com", "https://polygon-rpc.com"]
 # -----------------------------------------------------------------------------
 
@@ -166,7 +167,7 @@ def key_wallet(k):
 # ---- persistence ------------------------------------------------------------
 def load_config():
     global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, MODE, \
-        PRIVATE_KEY_MEM, MIN_HIS_NOTIONAL
+        PRIVATE_KEY_MEM, MIN_HIS_NOTIONAL, SIGNATURE_TYPE
     if not CONFIG_FILE.exists():
         return
     c = json.loads(CONFIG_FILE.read_text())
@@ -180,6 +181,7 @@ def load_config():
     SLIPPAGE = c.get("slippage", SLIPPAGE)
     BANKROLL = c.get("bankroll", BANKROLL)
     MIN_HIS_NOTIONAL = c.get("min_his", MIN_HIS_NOTIONAL)
+    SIGNATURE_TYPE = c.get("sig_type", SIGNATURE_TYPE)
     STATE["funder"] = c.get("funder", "")
 
 
@@ -187,7 +189,7 @@ def save_config():
     CONFIG_FILE.write_text(json.dumps({  # includes the key: owner's choice, file is gitignored
         "targets": TARGETS, "funder": STATE.get("funder", ""), "fraction": COPY_FRACTION,
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
-        "mode": MODE, "min_his": MIN_HIS_NOTIONAL,
+        "mode": MODE, "min_his": MIN_HIS_NOTIONAL, "sig_type": SIGNATURE_TYPE,
         "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
 
@@ -256,21 +258,29 @@ def tick_of(tid):
     return TICKS[tid]
 
 
-def onchain_usdc(addr):
-    """USDC.e balance straight from Polygon (no auth, authoritative). None on failure.
-    This is the ground truth for 'how much cash is in this wallet'."""
-    if not valid_addr(addr):
-        return None
+def _erc20_balance(token, addr):
     data = "0x70a08231" + addr[2:].lower().rjust(64, "0")  # balanceOf(addr)
     for rpc in POLYGON_RPCS:
         try:
             r = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                              "params": [{"to": USDC_E, "data": data}, "latest"]}, timeout=8).json()
+                              "params": [{"to": token, "data": data}, "latest"]}, timeout=8).json()
             if r.get("result"):
                 return int(r["result"], 16) / 1e6
         except Exception:
             continue
     return None
+
+
+def onchain_usdc(addr):
+    """Spendable cash straight from Polygon (no auth, authoritative): pUSD (the
+    collateral since Polymarket's V2 upgrade) plus any legacy USDC.e. None on failure."""
+    if not valid_addr(addr):
+        return None
+    pusd = _erc20_balance(PUSD, addr)
+    usdce = _erc20_balance(USDC_E, addr)
+    if pusd is None and usdce is None:
+        return None
+    return (pusd or 0.0) + (usdce or 0.0)
 
 
 def fetch_wallet():
@@ -313,14 +323,42 @@ def fetch_name(addr):
 
 def make_client():
     # v2 client: the exchange rejected v1's order signing ("invalid order version")
+    global SIGNATURE_TYPE
     from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
     k = PRIVATE_KEY_MEM or os.environ.get("PM_PRIVATE_KEY")
     funder = STATE.get("funder") or os.environ.get("PM_FUNDER")
     if not k or not funder:
         raise RuntimeError("set private key and funder in Settings")
-    c = ClobClient(CLOB_HOST, key=k, chain_id=137, signature_type=SIGNATURE_TYPE, funder=funder)
-    c.set_api_creds(c.create_or_derive_api_key())
-    return c
+
+    def build(sig):
+        cl = ClobClient(CLOB_HOST, key=k, chain_id=137, signature_type=sig, funder=funder)
+        cl.set_api_creds(cl.create_or_derive_api_key())
+        return cl
+
+    def clob_balance(cl):
+        try:
+            b = cl.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            return float(b.get("balance", 0)) / 1e6 if isinstance(b, dict) else 0.0
+        except Exception:
+            return 0.0
+
+    cl = build(SIGNATURE_TYPE)
+    if clob_balance(cl) <= 0:
+        # the exchange keeps a separate ledger per signature type — find the funded one
+        for sig in (3, 2, 1, 0):
+            if sig == SIGNATURE_TYPE:
+                continue
+            try:
+                alt = build(sig)
+            except Exception:
+                continue
+            if clob_balance(alt) > 0:
+                SIGNATURE_TYPE = sig
+                save_config()
+                logline(kind="skip", note=f"auto-detected wallet signature type {sig} (exchange holds balance there)")
+                return alt
+    return cl
 
 
 # ---- trading ----------------------------------------------------------------
@@ -845,7 +883,7 @@ def _wallet_card():
     if cash is None:
         cash_s = "cash: couldn't read chain (retrying)"
     else:
-        cash_s = f"${cash:,.2f} USDC cash"
+        cash_s = f"${cash:,.2f} cash (pUSD)"
         if tradeable is not None and abs(tradeable - cash) > 0.01:
             cash_s += f" (${tradeable:,.2f} tradeable on CLOB)"
     total_s = f" · ${cash + total:,.2f} total" if cash is not None else ""
@@ -1332,7 +1370,7 @@ def _check():
     STATE["wallet"] = {"usdc": 28.5, "checked": "0x" + "a" * 40,
                        "positions": [{"title": "Q", "outcome": "Yes", "size": 10, "avgPrice": 0.5,
                                       "curPrice": 0.6, "currentValue": 6.0, "cashPnl": 1.0}]}
-    assert "$28.50 USDC cash" in _wallet_card() and "$34.50 total" in _wallet_card()
+    assert "$28.50 cash (pUSD)" in _wallet_card() and "$34.50 total" in _wallet_card()
     STATE["wallet"] = {"usdc": 0.0, "checked": "0x" + "b" * 40, "positions": []}
     assert "empty on-chain" in _wallet_card()  # wrong-wallet warning fires
     print("self-check OK")
