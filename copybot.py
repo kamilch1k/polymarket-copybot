@@ -799,6 +799,35 @@ details.cfg summary{{cursor:pointer;font-weight:700}}
 {_settings_form()}
 <div id=dyn>{render_dyn()}</div>
 <script>
+// instant paste feedback: green the moment the value looks right, red + reason
+// if not. Server re-verifies cryptographically on Save.
+(function() {{
+  var rules = {{
+    target: {{ test: function(v) {{ return v.trim().split(/[\\s,]+/).every(function(a) {{ return /^0x[a-fA-F0-9]{{40}}$/.test(a); }}); }},
+              ok: '✓ valid address — press Save', bad: '✗ not a valid 0x address (42 chars)' }},
+    funder: {{ test: function(v) {{ return /^0x[a-fA-F0-9]{{40}}$/.test(v.trim()); }},
+              ok: '✓ valid address — press Save', bad: '✗ not a valid 0x address (42 chars)' }},
+    private_key: {{ test: function(v) {{ return /^(0x)?[0-9a-fA-F]{{64}}$/.test(v.trim()); }},
+              ok: '✓ valid key format — press Save to verify + store', bad: '✗ a key is 64 hex chars (66 with 0x)' }}
+  }};
+  document.querySelectorAll('.settings input').forEach(function(inp) {{
+    var rule = rules[inp.name];
+    if (!rule) return;
+    var hint = document.createElement('div');
+    hint.style.fontSize = '11px';
+    inp.parentNode.appendChild(hint);
+    var paint = function() {{
+      var v = inp.value.trim();
+      if (!v) {{ inp.style.border = ''; hint.textContent = ''; return; }}
+      var good = rule.test(v);
+      inp.style.border = '2px solid ' + (good ? '#16a34a' : '#dc2626');
+      hint.style.color = good ? '#4ade80' : '#f87171';
+      hint.textContent = good ? rule.ok : rule.bad;
+    }};
+    inp.addEventListener('input', paint);
+    paint();  // also color prefilled (saved) values on load
+  }});
+}})();
 // live update: only the #dyn region is swapped — the settings form above is
 // never re-rendered, so nothing you type can ever disappear.
 setInterval(function() {{
