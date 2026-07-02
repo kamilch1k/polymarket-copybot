@@ -415,15 +415,14 @@ def _leader_rows():
 
 def _settings_form():
     is_ready = ready()
-    open_attr = "" if is_ready else "open"
-    pk_set = STATE.get("pk_set") or bool(os.environ.get("PM_PRIVATE_KEY"))
-    pk_status = "🔑 set (memory)" if pk_set else "not set"
+    pk_val = PRIVATE_KEY_MEM or os.environ.get("PM_PRIVATE_KEY", "")
     funder_val = STATE.get("funder", "") or os.environ.get("PM_FUNDER", "")
-    return f"""<details {open_attr} class=cfg><summary>⚙ Settings {'· ✅ ready' if is_ready else '· ⚠ setup needed'}</summary>
+    return f"""<div class=card style=margin-bottom:16px>
+<h2 style=margin-top:0>⚙ Settings {'· ✅ ready' if is_ready else '· ⚠ setup needed'}</h2>
 <form method=post action=/settings class=settings>
   <label>Target wallet<input name=target value="{TARGET}" placeholder="0x… (or click a leaderboard trader)"></label>
   <label>Funder wallet (your deposit address)<input name=funder value="{funder_val}" placeholder="0x…"></label>
-  <label>Private key — {pk_status}<input name=private_key type=text autocomplete=off placeholder="paste to set · blank keeps current"></label>
+  <label>Private key (memory only, never saved to disk)<input name=private_key value="{pk_val}" autocomplete=off placeholder="0x…"></label>
   <label>Mode<select name=mode>
     <option value=auto {"selected" if MODE == "auto" else ""}>auto — copy instantly</option>
     <option value=approve {"selected" if MODE == "approve" else ""}>approve — I click ✓ per trade</option>
@@ -434,11 +433,12 @@ def _settings_form():
   <label>Bankroll $<input name=bankroll value="{BANKROLL}"></label>
   <button class=save type=submit>Save</button>
 </form>
-<p class=dim>Key is held in memory only, never written to disk — re-enter after restart. Page is localhost-only.</p>
-</details>"""
+</div>"""
 
 
-def render():
+def render_dyn():
+    """Everything that changes — swapped into the page in place every 3s.
+    The settings form lives OUTSIDE this, so refresh can never eat your input."""
     with LOCK:
         live, copies, err = STATE["live"], STATE["copies"], STATE["error"]
         started, last = STATE["started"], STATE["last_poll"]
@@ -477,33 +477,7 @@ def render():
     funder = STATE.get("funder") or os.environ.get("PM_FUNDER", "")
     funder_chip = f'<span class="tag dim">funder {funder}</span>' if funder else ""
 
-    return f"""<!doctype html><html><head><meta charset=utf-8>
-<title>copybot</title><style>
-body{{background:#0b0f17;color:#e5e7eb;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:18px;max-width:1100px}}
-h1{{font-size:15px;margin:0 0 12px}} .dim{{color:#6b7280}} .r{{text-align:right}}
-.bar{{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px}}
-.grid{{display:grid;grid-template-columns:1fr 1fr;gap:22px}}
-span.pill,span.tag{{padding:3px 9px;border-radius:6px;font-weight:600}}
-button{{border:0;border-radius:6px;padding:6px 13px;font:inherit;font-weight:700;cursor:pointer}}
-button.go{{background:#166534;color:#fff}} button.dry{{background:#374151;color:#fff}}
-button.kill{{background:#7f1d1d;color:#fff}} button.copy{{background:#1d4ed8;color:#fff;padding:3px 10px}}
-button.save{{background:#1d4ed8;color:#fff;margin-top:4px}}
-table{{border-collapse:collapse;width:100%;margin:4px 0 16px}}
-td,th{{padding:4px 9px;border-bottom:1px solid #1f2937;text-align:left}} th{{color:#9ca3af;font-weight:600}}
-h2{{font-size:12px;color:#9ca3af;text-transform:uppercase;letter-spacing:.05em;margin:14px 0 2px}}
-.err{{background:#7f1d1d;color:#fecaca;padding:6px 10px;border-radius:6px;margin-bottom:12px}}
-ul.tips{{margin:4px 0 16px;padding-left:18px}} ul.tips li{{margin:2px 0}}
-.card{{background:#0f1523;border:1px solid #1f2937;border-radius:10px;padding:14px 16px}}
-details.cfg{{background:#0f1523;border:1px solid #1f2937;border-radius:10px;padding:10px 14px;margin-bottom:16px}}
-details.cfg summary{{cursor:pointer;font-weight:700}}
-.settings{{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin-top:12px}}
-.settings label{{display:flex;flex-direction:column;font-size:11px;color:#9ca3af;gap:3px}}
-.settings input,.settings select{{background:#0b0f17;border:1px solid #334155;border-radius:6px;color:#e5e7eb;padding:6px 8px;font:inherit}}
-.settings button{{grid-column:1/-1;justify-self:start}}
-</style></head><body>
-<h1>Polymarket copybot</h1>
-{_settings_form()}
-<div class=bar>
+    return f"""<div class=bar>
   <span class=pill>{pill}</span>
   <span class="tag dim">target {tlabel}</span>
   {funder_chip}
@@ -534,16 +508,44 @@ details.cfg summary{{cursor:pointer;font-weight:700}}
 <h2>Trade history</h2>
 <div class=card><table><tr><th>when</th><th>kind</th><th>side</th><th>market — outcome</th><th class=r>size</th><th>note</th></tr>{_history_rows()}</table></div>
 <h2>Bot activity log</h2>
-<div class=card><table><tr><th>time</th><th>kind</th><th>side</th><th>market — outcome</th><th class=r>size</th><th>note</th></tr>{lrows}</table></div>
+<div class=card><table><tr><th>time</th><th>kind</th><th>side</th><th>market — outcome</th><th class=r>size</th><th>note</th></tr>{lrows}</table></div>"""
+
+
+def render():
+    return f"""<!doctype html><html><head><meta charset=utf-8>
+<title>copybot</title><style>
+body{{background:#0b0f17;color:#e5e7eb;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:18px;max-width:1100px}}
+h1{{font-size:15px;margin:0 0 12px}} .dim{{color:#6b7280}} .r{{text-align:right}}
+.bar{{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px}}
+.grid{{display:grid;grid-template-columns:1fr 1fr;gap:22px}}
+span.pill,span.tag{{padding:3px 9px;border-radius:6px;font-weight:600}}
+button{{border:0;border-radius:6px;padding:6px 13px;font:inherit;font-weight:700;cursor:pointer}}
+button.go{{background:#166534;color:#fff}} button.dry{{background:#374151;color:#fff}}
+button.kill{{background:#7f1d1d;color:#fff}} button.copy{{background:#1d4ed8;color:#fff;padding:3px 10px}}
+button.save{{background:#1d4ed8;color:#fff;margin-top:4px}}
+table{{border-collapse:collapse;width:100%;margin:4px 0 16px}}
+td,th{{padding:4px 9px;border-bottom:1px solid #1f2937;text-align:left}} th{{color:#9ca3af;font-weight:600}}
+h2{{font-size:12px;color:#9ca3af;text-transform:uppercase;letter-spacing:.05em;margin:14px 0 2px}}
+.err{{background:#7f1d1d;color:#fecaca;padding:6px 10px;border-radius:6px;margin-bottom:12px}}
+ul.tips{{margin:4px 0 16px;padding-left:18px}} ul.tips li{{margin:2px 0}}
+.card{{background:#0f1523;border:1px solid #1f2937;border-radius:10px;padding:14px 16px}}
+details.cfg{{background:#0f1523;border:1px solid #1f2937;border-radius:10px;padding:10px 14px;margin-bottom:16px}}
+details.cfg summary{{cursor:pointer;font-weight:700}}
+.settings{{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin-top:12px}}
+.settings label{{display:flex;flex-direction:column;font-size:11px;color:#9ca3af;gap:3px}}
+.settings input,.settings select{{background:#0b0f17;border:1px solid #334155;border-radius:6px;color:#e5e7eb;padding:6px 8px;font:inherit}}
+.settings button{{grid-column:1/-1;justify-self:start}}
+</style></head><body>
+<h1>Polymarket copybot</h1>
+{_settings_form()}
+<div id=dyn>{render_dyn()}</div>
 <script>
-// auto-refresh, but never while you're editing settings (unsaved text survives)
+// live update: only the #dyn region is swapped — the settings form above is
+// never re-rendered, so nothing you type can ever disappear.
 setInterval(function() {{
-  var a = document.activeElement;
-  if (a && (a.tagName === 'INPUT' || a.tagName === 'SELECT')) return;
-  var dirty = Array.prototype.some.call(
-    document.querySelectorAll('.settings input'),
-    function(i) {{ return i.value !== i.defaultValue; }});
-  if (!dirty) location.reload();
+  fetch('/dyn').then(function(r) {{ return r.text(); }})
+    .then(function(h) {{ document.getElementById('dyn').innerHTML = h; }})
+    .catch(function() {{}});
 }}, 3000);
 </script>
 </body></html>"""
@@ -564,7 +566,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        self._send(200, render())
+        if urlparse(self.path).path == "/dyn":
+            self._send(200, render_dyn())
+        else:
+            self._send(200, render())
 
     def do_POST(self):
         global TARGET, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, PRIVATE_KEY_MEM, MODE
@@ -674,14 +679,24 @@ if __name__ == "__main__":
         _check()
         sys.exit()
     url = f"http://127.0.0.1:{PORT}"
+    ThreadingHTTPServer.allow_reuse_address = False  # else two instances share the port on Windows
     try:
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     except OSError:
-        webbrowser.open(url)  # already running — just open its window
-        sys.exit()
-    load_config()
-    load_state()
-    threading.Thread(target=bot_loop, daemon=True).start()
-    print(f"copybot: {url}  (configure in the page, then Go LIVE)")
-    webbrowser.open(url)
-    server.serve_forever()
+        server = None  # already running — just open a window on it
+    if server:
+        load_config()
+        load_state()
+        threading.Thread(target=bot_loop, daemon=True).start()
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        print(f"copybot: {url}")
+    try:
+        import webview  # native desktop window (Windows WebView2)
+        webview.create_window("Copybot", url, width=1180, height=920)
+        webview.start()          # returns when the window is closed
+        os._exit(0)              # window closed = app quits, bot stops
+    except ImportError:
+        webbrowser.open(url)     # fallback: browser tab
+        if server:
+            while True:
+                time.sleep(3600)
