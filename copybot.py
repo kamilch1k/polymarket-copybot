@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 # ---- config (defaults; editable live in the web UI) -------------------------
-TARGET = ""                   # his proxy wallet — set it in the page
+TARGETS = []                  # proxy wallets to copy — set in the page, several OK
 BANKROLL = 30.0               # your total stake, for sizing hints only
 COPY_FRACTION = 0.01          # copy 1% of his share size
 MAX_USDC_PER_TRADE = 5.0      # per-copy notional cap
@@ -55,8 +55,9 @@ LOCK = threading.Lock()
 STATE = {
     "live": False, "holdings": {}, "names": {}, "seen": set(), "baselined": set(),
     "log": deque(maxlen=200), "copies": 0, "started": time.time(), "last_poll": 0.0,
-    "error": "", "target_name": "", "target_feed": [], "leaders": [],
-    "funder": "", "pk_set": False,
+    "error": "", "tnames": {}, "target_feed": [], "leaders": [],
+    "funder": "", "pk_set": False, "conn": None,  # conn: (ok?, message) after Test
+
     "pending": {}, "pid": 0,     # trades awaiting approval (approve mode)
     "history": [],               # every executed copy, persisted
 }
@@ -111,16 +112,25 @@ def copy_stats(feed):
 def ready():
     key_ = PRIVATE_KEY_MEM or os.environ.get("PM_PRIVATE_KEY")
     funder = STATE.get("funder") or os.environ.get("PM_FUNDER")
-    return bool(TARGET and key_ and funder)
+    return bool(TARGETS and key_ and funder)
+
+
+def parse_targets(text):
+    """Comma/space-separated 0x addresses -> validated list."""
+    out = []
+    for a in text.replace(",", " ").split():
+        if a.startswith("0x") and len(a) == 42 and a not in out:
+            out.append(a)
+    return out
 
 
 # ---- persistence ------------------------------------------------------------
 def load_config():
-    global TARGET, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, MODE
+    global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, MODE
     if not CONFIG_FILE.exists():
         return
     c = json.loads(CONFIG_FILE.read_text())
-    TARGET = c.get("target", TARGET)
+    TARGETS = c.get("targets") or ([c["target"]] if c.get("target") else [])
     MODE = c.get("mode", MODE)
     COPY_FRACTION = c.get("fraction", COPY_FRACTION)
     MAX_USDC_PER_TRADE = c.get("cap", MAX_USDC_PER_TRADE)
@@ -131,7 +141,7 @@ def load_config():
 
 def save_config():
     CONFIG_FILE.write_text(json.dumps({  # no private key here, on purpose
-        "target": TARGET, "funder": STATE.get("funder", ""), "fraction": COPY_FRACTION,
+        "targets": TARGETS, "funder": STATE.get("funder", ""), "fraction": COPY_FRACTION,
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
         "mode": MODE}, indent=2))
 
@@ -300,41 +310,53 @@ def bot_loop():
                     STATE["leaders"] = leaders
         polls += 1
 
-        target = TARGET
-        if not target:
+        if not TARGETS:
             time.sleep(POLL_SECONDS)
             continue
 
-        try:
-            trades = fetch_trades(target)
-            with LOCK:
-                STATE["error"] = ""
-                STATE["last_poll"] = time.time()
-                STATE["target_feed"] = trades[:25]
-        except Exception as ex:
-            with LOCK:
-                STATE["error"] = str(ex)
-            time.sleep(POLL_SECONDS)
-            continue
-
-        with LOCK:
-            first_time = target not in STATE["baselined"]
-        if first_time:
-            with LOCK:
-                for t in trades:
-                    STATE["seen"].add(key(t))
-                STATE["baselined"].add(target)
-                STATE["target_name"] = fetch_name(target) or STATE["target_name"]
-            logline(kind="skip", note=f"baselined {len(trades)} past trades — watching from now")
-        else:
-            for t in reversed(trades):
-                k = key(t)
+        merged = []
+        for target in list(TARGETS):
+            try:
+                trades = fetch_trades(target)
                 with LOCK:
-                    fresh = k not in STATE["seen"]
-                if fresh:
-                    handle(t)
+                    STATE["error"] = ""
+                    STATE["last_poll"] = time.time()
+            except Exception as ex:
+                with LOCK:
+                    STATE["error"] = f"{target[:8]}…: {ex}"
+                continue
+
+            with LOCK:
+                nm = STATE["tnames"].get(target)
+            if not nm:
+                nm = fetch_name(target) or target[:8] + "…"
+                with LOCK:
+                    STATE["tnames"][target] = nm
+            for t in trades:
+                t["_who"] = nm
+            merged += trades[:25]
+
+            with LOCK:
+                first_time = target not in STATE["baselined"]
+            if first_time:
+                with LOCK:
+                    for t in trades:
+                        STATE["seen"].add(key(t))
+                    STATE["baselined"].add(target)
+                logline(kind="skip", note=f"baselined {len(trades)} past trades of {nm} — watching from now")
+            else:
+                for t in reversed(trades):
+                    k = key(t)
                     with LOCK:
-                        STATE["seen"].add(k)
+                        fresh = k not in STATE["seen"]
+                    if fresh:
+                        handle(t)
+                        with LOCK:
+                            STATE["seen"].add(k)
+
+        merged.sort(key=lambda t: t.get("timestamp", 0), reverse=True)
+        with LOCK:
+            STATE["target_feed"] = merged[:25]
         save_state()
         time.sleep(POLL_SECONDS)
 
@@ -387,15 +409,46 @@ def _target_rows():
         side = str(t.get("side", "")).upper()
         col = "#4ade80" if side == "BUY" else "#fca5a5"
         name = f"{t.get('title', '?')} — {t.get('outcome', '?')}"
-        out += (f'<tr><td style=color:{col}>{side}</td><td>{name}</td>'
+        out += (f'<tr><td class=dim>{t.get("_who", "")}</td><td style=color:{col}>{side}</td><td>{name}</td>'
                 f'<td class=r>{float(t.get("size", 0)):g}</td><td class=r>@{t.get("price", "")}</td></tr>')
-    return out or "<tr><td colspan=4 class=dim>no recent activity</td></tr>"
+    return out or "<tr><td colspan=5 class=dim>no recent activity</td></tr>"
+
+
+def _status_card():
+    """Am-I-actually-set-up panel: every prerequisite with its fix."""
+    with LOCK:
+        last, conn, live = STATE["last_poll"], STATE["conn"], STATE["live"]
+        tnames = dict(STATE["tnames"])
+    key_ok = bool(PRIVATE_KEY_MEM or os.environ.get("PM_PRIVATE_KEY"))
+    funder_ok = bool(STATE.get("funder") or os.environ.get("PM_FUNDER"))
+    feed_ok = bool(last and time.time() - last < POLL_SECONDS * 3)
+    tgt_label = ", ".join(tnames.get(a, a[:8] + "…") for a in TARGETS)
+    conn_ok = bool(conn and conn[0])
+    conn_msg = (conn[1] if conn else 'unverified — click "Test connection"')
+    items = [
+        ("Target trader(s)", bool(TARGETS),
+         tgt_label or "paste an address in Settings, or click copy on the leaderboard below"),
+        ("Watching their trades (data feed)", feed_ok,
+         "live" if feed_ok else "waiting for first poll — needs a target set"),
+        ("Funder wallet", funder_ok, "saved" if funder_ok else "paste your Polymarket deposit address in Settings"),
+        ("Private key", key_ok,
+         "saved (memory only — re-enter after each launch)" if key_ok else "paste it in Settings"),
+        ("Polymarket trading connection", conn_ok, conn_msg),
+        ("Live trading", live, "ON — copying for real" if live else "OFF — click Go LIVE once everything above is ✓"),
+    ]
+    rows = "".join(
+        f'<tr><td>{"✅" if ok else "❌"}</td><td>{what}</td><td class=dim>{detail}</td></tr>'
+        for what, ok, detail in items)
+    return (f'<div class=card style=margin-bottom:16px><h2 style=margin-top:0>Status — what\'s left to make it trade</h2>'
+            f'<table>{rows}</table>'
+            f'<form method=post action=/test style=display:inline><button class=copy>Test connection</button></form>'
+            f'</div>')
 
 
 def _leader_rows():
     with LOCK:
         leaders = list(STATE["leaders"])
-        cur = TARGET.lower()
+    cur = {a.lower() for a in TARGETS}
     out = ""
     for i, l in enumerate(leaders, 1):
         addr = str(l.get("proxyWallet") or l.get("address") or "")
@@ -405,9 +458,11 @@ def _leader_rows():
             pnl = f"${float(pnl):,.0f}"
         except (TypeError, ValueError):
             pnl = str(pnl)
-        here = " style=background:#1e293b" if addr.lower() == cur else ""
+        copying = addr.lower() in cur
+        here = " style=background:#1e293b" if copying else ""
+        label, cls = ("✓ copying — drop", "dry") if copying else ("copy", "copy")
         btn = (f'<form method=post action=/target style=margin:0><input type=hidden name=addr value="{addr}">'
-               f'<button class=copy>copy</button></form>') if addr else ""
+               f'<button class={cls}>{label}</button></form>') if addr else ""
         out += (f'<tr{here}><td class=dim>{i}</td><td>{nm}</td>'
                 f'<td class=r style=color:#4ade80>{pnl}</td><td>{btn}</td></tr>')
     return out or "<tr><td colspan=4 class=dim>leaderboard loading…</td></tr>"
@@ -420,7 +475,7 @@ def _settings_form():
     return f"""<div class=card style=margin-bottom:16px>
 <h2 style=margin-top:0>⚙ Settings {'· ✅ ready' if is_ready else '· ⚠ setup needed'}</h2>
 <form method=post action=/settings class=settings>
-  <label>Target wallet<input name=target value="{TARGET}" placeholder="0x… (or click a leaderboard trader)"></label>
+  <label>Target wallet(s) — comma-separate for several<input name=target value="{', '.join(TARGETS)}" placeholder="0x…, 0x… (or click copy on leaderboard traders)"></label>
   <label>Funder wallet (your deposit address)<input name=funder value="{funder_val}" placeholder="0x…"></label>
   <label>Private key (memory only, never saved to disk)<input name=private_key value="{pk_val}" autocomplete=off placeholder="0x…"></label>
   <label>Mode<select name=mode>
@@ -443,7 +498,7 @@ def render_dyn():
         live, copies, err = STATE["live"], STATE["copies"], STATE["error"]
         started, last = STATE["started"], STATE["last_poll"]
         holdings = [(STATE["names"].get(k, k[:16]), v) for k, v in STATE["holdings"].items() if v > 0]
-        tname = STATE["target_name"]
+        tnames = dict(STATE["tnames"])
         feed = list(STATE["target_feed"])
         log = list(STATE["log"])
     up = int(time.time() - started)
@@ -473,7 +528,7 @@ def render_dyn():
     lrows = lrows or "<tr><td colspan=6 class=dim>waiting…</td></tr>"
     stats = "".join(f"<li>{s}</li>" for s in copy_stats(feed))
     errbar = f'<div class=err>{err}</div>' if err else ""
-    tlabel = ((tname + " · " if tname else "") + TARGET) if TARGET else "none set"
+    tlabel = ", ".join(tnames.get(a, a[:8] + "…") for a in TARGETS) or "none set"
     funder = STATE.get("funder") or os.environ.get("PM_FUNDER", "")
     funder_chip = f'<span class="tag dim">funder {funder}</span>' if funder else ""
 
@@ -488,6 +543,7 @@ def render_dyn():
   <form method=post action=/kill style=display:inline onsubmit="return confirm('Kill the bot?')"><button class=kill>Kill</button></form>
 </div>
 {errbar}
+{_status_card()}
 {_pending_card()}
 <div class=grid>
   <div class=card>
@@ -497,8 +553,8 @@ def render_dyn():
     <table><tr><th>time</th><th>market — outcome</th><th class=r>size</th></tr>{irows}</table>
   </div>
   <div class=card>
-    <h2>Target — live activity</h2>
-    <table><tr><th>side</th><th>market — outcome</th><th class=r>size</th><th class=r>px</th></tr>{_target_rows()}</table>
+    <h2>Targets — live activity</h2>
+    <table><tr><th>trader</th><th>side</th><th>market — outcome</th><th class=r>size</th><th class=r>px</th></tr>{_target_rows()}</table>
     <h2>How to copy him best</h2>
     <ul class=tips>{stats}</ul>
   </div>
@@ -572,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, render())
 
     def do_POST(self):
-        global TARGET, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, PRIVATE_KEY_MEM, MODE
+        global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, PRIVATE_KEY_MEM, MODE, CLIENT
         path = urlparse(self.path).path
         body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)).decode()
         f = parse_qs(body)
@@ -596,6 +652,26 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 with LOCK:
                     STATE["error"] = "Set target + funder + private key in Settings before going live."
+        elif path == "/test":
+            CLIENT = None  # force a fresh connection with current creds
+            try:
+                cl = get_client()
+                bal = ""
+                try:
+                    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+                    b = cl.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                    if isinstance(b, dict) and b.get("balance") is not None:
+                        bal = f" · balance ${float(b['balance']) / 1e6:,.2f} USDC"
+                except Exception:
+                    pass  # connection proved; balance is a bonus
+                with LOCK:
+                    STATE["conn"] = (True, f"connected — API creds derived OK{bal}")
+            except KeyError as ex:
+                with LOCK:
+                    STATE["conn"] = (False, f"missing setting: {ex}")
+            except Exception as ex:
+                with LOCK:
+                    STATE["conn"] = (False, str(ex)[:160])
         elif path == "/approve":
             pid = f.get("id", [""])[0]
             with LOCK:
@@ -611,32 +687,41 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/dry":
             with LOCK:
                 STATE["live"] = False
-        elif path in ("/target", "/settings"):
-            addr = (f.get("addr", [""])[0] or f.get("target", [""])[0]).strip()
-            if addr.startswith("0x") and len(addr) == 42 and addr != TARGET:
-                TARGET = addr
-                with LOCK:
-                    STATE["baselined"].discard(addr)
-                    STATE["target_name"] = ""
-                    STATE["error"] = ""
-                logline(kind="skip", note=f"target -> {addr[:8]}…")
-            if path == "/settings":
-                fn = f.get("funder", [""])[0].strip()
-                if fn:
-                    STATE["funder"] = fn
-                pk = f.get("private_key", [""])[0].strip()
-                if pk:
-                    PRIVATE_KEY_MEM = pk
+        elif path == "/target":  # leaderboard button: toggle copying this trader
+            addr = f.get("addr", [""])[0].strip()
+            if addr.startswith("0x") and len(addr) == 42:
+                if addr in TARGETS:
+                    TARGETS.remove(addr)
+                    logline(kind="skip", note=f"dropped target {addr[:8]}…")
+                else:
+                    TARGETS.append(addr)
                     with LOCK:
-                        STATE["pk_set"] = True
-                m = f.get("mode", [""])[0]
-                if m in ("auto", "approve"):
-                    MODE = m
-                COPY_FRACTION = num("fraction", COPY_FRACTION)
-                MAX_USDC_PER_TRADE = num("cap", MAX_USDC_PER_TRADE)
-                SLIPPAGE = num("slippage", SLIPPAGE)
-                BANKROLL = num("bankroll", BANKROLL)
+                        STATE["baselined"].discard(addr)
+                    logline(kind="skip", note=f"added target {addr[:8]}…")
                 save_config()
+        elif path == "/settings":
+            new_targets = parse_targets(f.get("target", [""])[0])
+            for a in new_targets:
+                if a not in TARGETS:
+                    with LOCK:
+                        STATE["baselined"].discard(a)
+            TARGETS = new_targets
+            fn = f.get("funder", [""])[0].strip()
+            if fn:
+                STATE["funder"] = fn
+            pk = f.get("private_key", [""])[0].strip()
+            if pk:
+                PRIVATE_KEY_MEM = pk
+                with LOCK:
+                    STATE["pk_set"] = True
+            m = f.get("mode", [""])[0]
+            if m in ("auto", "approve"):
+                MODE = m
+            COPY_FRACTION = num("fraction", COPY_FRACTION)
+            MAX_USDC_PER_TRADE = num("cap", MAX_USDC_PER_TRADE)
+            SLIPPAGE = num("slippage", SLIPPAGE)
+            BANKROLL = num("bankroll", BANKROLL)
+            save_config()
         elif path == "/kill":
             self._send(200, "bye")
             os._exit(0)  # ponytail: abrupt, but it's a side-project button
@@ -669,8 +754,12 @@ def _check():
     assert STATE["holdings"]["t2"] == 10.0
     MODE = "auto"
     assert any("1 buys" in x for x in copy_stats([{"side": "BUY", "size": 100, "price": 0.5}]))
+    a1, a2 = "0x" + "1" * 40, "0x" + "2" * 40
+    assert parse_targets(f"{a1}, {a2} garbage 0xshort") == [a1, a2]
     html = render()
     assert "copybot" in html and "Settings" in html and "leaderboard" in html and "Trade history" in html
+    dyn = render_dyn()
+    assert "Status" in dyn and "Test connection" in dyn and "❌" in dyn  # unconfigured -> red rows
     print("self-check OK")
 
 
