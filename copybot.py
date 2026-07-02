@@ -9,8 +9,9 @@ activity + how to copy him best, and a leaderboard of traders to one-click copy.
 
 Localhost-only on purpose: the page has a live-trade switch and a kill button.
 
-SECURITY: target/funder/sizing persist to copybot_config.json. Your PRIVATE KEY
-is kept in memory only — never written to disk — so re-enter it after a restart.
+Everything — targets, funder, sizing, AND the private key — persists to
+copybot_config.json next to this file. That file is gitignored (never pushed);
+it is plaintext on this PC, by the owner's choice. Configure once, runs forever.
 
 SETUP
   pip install py-clob-client requests
@@ -43,7 +44,7 @@ POLL_SECONDS = 15
 LEADERS_EVERY = 20            # refresh leaderboard every N polls (~5 min)
 SIGNATURE_TYPE = 1            # 1 = email/magic login, 2 = browser wallet
 PORT = 8777
-PRIVATE_KEY_MEM = None        # in-memory only, never persisted
+PRIVATE_KEY_MEM = None        # persisted to config by owner's choice (single-user PC)
 CONFIG_FILE = Path(__file__).with_name("copybot_config.json")
 STATE_FILE = Path(__file__).with_name("copybot_state.json")
 DATA_API = "https://data-api.polymarket.com"
@@ -126,11 +127,14 @@ def parse_targets(text):
 
 # ---- persistence ------------------------------------------------------------
 def load_config():
-    global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, MODE
+    global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, MODE, PRIVATE_KEY_MEM
     if not CONFIG_FILE.exists():
         return
     c = json.loads(CONFIG_FILE.read_text())
     TARGETS = c.get("targets") or ([c["target"]] if c.get("target") else [])
+    if c.get("private_key"):
+        PRIVATE_KEY_MEM = c["private_key"]
+        STATE["pk_set"] = True
     MODE = c.get("mode", MODE)
     COPY_FRACTION = c.get("fraction", COPY_FRACTION)
     MAX_USDC_PER_TRADE = c.get("cap", MAX_USDC_PER_TRADE)
@@ -140,10 +144,10 @@ def load_config():
 
 
 def save_config():
-    CONFIG_FILE.write_text(json.dumps({  # no private key here, on purpose
+    CONFIG_FILE.write_text(json.dumps({  # includes the key: owner's choice, file is gitignored
         "targets": TARGETS, "funder": STATE.get("funder", ""), "fraction": COPY_FRACTION,
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
-        "mode": MODE}, indent=2))
+        "mode": MODE, "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
 
 def load_state():
@@ -432,7 +436,7 @@ def _status_card():
          "live" if feed_ok else "waiting for first poll — needs a target set"),
         ("Funder wallet", funder_ok, "saved" if funder_ok else "paste your Polymarket deposit address in Settings"),
         ("Private key", key_ok,
-         "saved (memory only — re-enter after each launch)" if key_ok else "paste it in Settings"),
+         "saved to disk — survives restarts" if key_ok else "paste it in Settings"),
         ("Polymarket trading connection", conn_ok, conn_msg),
         ("Live trading", live, "ON — copying for real" if live else "OFF — click Go LIVE once everything above is ✓"),
     ]
@@ -477,7 +481,7 @@ def _settings_form():
 <form method=post action=/settings class=settings>
   <label>Target wallet(s) — comma-separate for several<input name=target value="{', '.join(TARGETS)}" placeholder="0x…, 0x… (or click copy on leaderboard traders)"></label>
   <label>Funder wallet (your deposit address)<input name=funder value="{funder_val}" placeholder="0x…"></label>
-  <label>Private key (memory only, never saved to disk)<input name=private_key value="{pk_val}" autocomplete=off placeholder="0x…"></label>
+  <label>Private key (saved to copybot_config.json on this PC)<input name=private_key value="{pk_val}" autocomplete=off placeholder="0x…"></label>
   <label>Mode<select name=mode>
     <option value=auto {"selected" if MODE == "auto" else ""}>auto — copy instantly</option>
     <option value=approve {"selected" if MODE == "approve" else ""}>approve — I click ✓ per trade</option>
