@@ -419,6 +419,8 @@ def try_go_live(source):
         get_client()
         with LOCK:
             STATE["live"] = True
+            if not STATE["conn"]:
+                STATE["conn"] = (True, "connected — creds verified at auto-live")
         logline(kind="live", note=f"auto-live: trading enabled ({source})")
     except Exception as ex:
         logline(kind="error", note=f"auto-live failed ({source}): {str(ex)[:120]}")
