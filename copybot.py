@@ -488,20 +488,35 @@ def handle(trade):
     submit({"tid": tid, "side": side, "shares": shares, "ref": ref, "name": name, "drift": drift})
 
 
+def pick_test_market():
+    """An active, liquid market whose token the CLOB verifiably accepts right now.
+    (The target's own feed is unusable here: fast sports markets resolve within
+    hours and their token ids go invalid — the cause of the 'invalid token id' 400.)"""
+    r = requests.get(f"{GAMMA_API}/markets",
+                     params={"active": "true", "closed": "false", "order": "volume24hr",
+                             "ascending": "false", "limit": 12}, timeout=15)
+    for m in r.json():
+        if m.get("enableOrderBook") is False or m.get("acceptingOrders") is False:
+            continue
+        try:
+            toks = json.loads(m.get("clobTokenIds") or "[]")
+        except ValueError:
+            continue
+        for tid in toks[:1]:
+            mid = midpoint(tid)
+            if mid and 0.05 <= mid <= 0.95:  # CLOB knows the token AND it's not near-resolved
+                return tid, mid, (m.get("question") or m.get("slug") or "?")
+    raise RuntimeError("no active liquid market found")
+
+
 def test_trade():
-    """Real-money end-to-end proof: buy ~$1 of the most recent market a target
-    touched, then immediately sell it back. Costs a few cents of spread.
+    """Real-money end-to-end proof: buy ~$1 on a live liquid market, then
+    immediately sell it back. Costs a few cents of spread.
     ponytail: $0.10 isn't possible — Polymarket rejects orders under $1 notional."""
     try:
         cl = get_client()
-        with LOCK:
-            feed = list(STATE["target_feed"])
-        t = next((x for x in feed if x.get("side")), None)
-        if not t:
-            logline(kind="error", note="test trade: no target activity seen yet — wait for a poll")
-            return
-        tid, ref = t["asset"], float(t["price"])
-        name = f"TEST · {t.get('title', '?')}"
+        tid, ref, title = pick_test_market()
+        name = f"TEST · {title}"
         from py_clob_client_v2.clob_types import OrderArgs, OrderType
         tick = tick_of(tid)
         buy_px = limit_price(ref, "BUY", tick)
