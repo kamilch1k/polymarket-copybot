@@ -14,7 +14,7 @@ copybot_config.json next to this file. That file is gitignored (never pushed);
 it is plaintext on this PC, by the owner's choice. Configure once, runs forever.
 
 SETUP
-  pip install py-clob-client requests
+  pip install py-clob-client-v2 requests websocket-client
 RUN
   python copybot.py --check     offline self-check
   python copybot.py             start app; browser opens; configure in the page
@@ -66,6 +66,7 @@ STATE = {
     "pending": {}, "pid": 0,     # trades awaiting approval (approve mode)
     "history": [],               # every executed copy, persisted
     "ws": False,                 # realtime feed connected?
+    "wallet": {},                # on-chain truth: usdc cash + open positions
 }
 
 
@@ -246,6 +247,33 @@ def tick_of(tid):
     return TICKS[tid]
 
 
+def fetch_wallet():
+    """On-chain truth for YOUR account: open positions (public data-api) and
+    USDC cash (CLOB, only when the trading client is connected)."""
+    funder = STATE.get("funder") or os.environ.get("PM_FUNDER")
+    if not funder:
+        return
+    w = {}
+    try:
+        pos = requests.get(f"{DATA_API}/positions", params={"user": funder, "limit": 50},
+                           timeout=15).json()
+        if isinstance(pos, list):
+            w["positions"] = [p for p in pos if float(p.get("size") or 0) > 0][:30]
+    except Exception:
+        pass
+    try:
+        if CLIENT:
+            from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+            b = CLIENT.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            if isinstance(b, dict) and b.get("balance") is not None:
+                w["usdc"] = float(b["balance"]) / 1e6
+    except Exception:
+        pass
+    if w:
+        with LOCK:
+            STATE["wallet"].update(w)
+
+
 def fetch_name(addr):
     try:
         r = requests.get(f"{GAMMA_API}/public-profile", params={"address": addr}, timeout=10)
@@ -258,13 +286,14 @@ def fetch_name(addr):
 
 
 def make_client():
-    from py_clob_client.client import ClobClient
+    # v2 client: the exchange rejected v1's order signing ("invalid order version")
+    from py_clob_client_v2.client import ClobClient
     k = PRIVATE_KEY_MEM or os.environ.get("PM_PRIVATE_KEY")
     funder = STATE.get("funder") or os.environ.get("PM_FUNDER")
     if not k or not funder:
         raise RuntimeError("set private key and funder in Settings")
     c = ClobClient(CLOB_HOST, key=k, chain_id=137, signature_type=SIGNATURE_TYPE, funder=funder)
-    c.set_api_creds(c.create_or_derive_api_creds())
+    c.set_api_creds(c.create_or_derive_api_key())
     return c
 
 
@@ -286,7 +315,7 @@ def _order(tid, side, shares, ref, name, drift=None):
         STATE["copies"] += 1
     kind, note = "dry", ""
     if live:
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client_v2.clob_types import OrderArgs, OrderType
         try:
             cl = get_client()
             signed = cl.create_order(OrderArgs(token_id=tid, price=price, size=shares, side=side))
@@ -391,7 +420,7 @@ def test_trade():
             return
         tid, ref = t["asset"], float(t["price"])
         name = f"TEST · {t.get('title', '?')}"
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client_v2.clob_types import OrderArgs, OrderType
         tick = tick_of(tid)
         buy_px = limit_price(ref, "BUY", tick)
         shares = round(MIN_NOTIONAL * 1.1 / buy_px, 2)
@@ -491,6 +520,7 @@ def bot_loop():
             if leaders:
                 with LOCK:
                     STATE["leaders"] = leaders
+        fetch_wallet()
         polls += 1
 
         if not TARGETS:
@@ -582,6 +612,30 @@ def _history_rows():
                 f'<td>{e.get("name", "")}</td><td class=r>{e.get("shares", "")} @ {e.get("price", "")}</td>'
                 f'<td class=dim>{e.get("note", "")}</td></tr>')
     return out or "<tr><td colspan=6 class=dim>no trades yet</td></tr>"
+
+
+def _wallet_card():
+    with LOCK:
+        w = dict(STATE["wallet"])
+    pos = w.get("positions", [])
+    cash = w.get("usdc")
+    total = sum(float(p.get("currentValue") or 0) for p in pos)
+    rows = ""
+    for p in pos:
+        pnl = float(p.get("cashPnl") or 0)
+        col = "#4ade80" if pnl >= 0 else "#f87171"
+        rows += (f'<tr><td>{p.get("title", "?")} — {p.get("outcome", "?")}</td>'
+                 f'<td class=r>{float(p.get("size") or 0):g}</td>'
+                 f'<td class=r>{float(p.get("avgPrice") or 0):.3f} → {float(p.get("curPrice") or 0):.3f}</td>'
+                 f'<td class=r>${float(p.get("currentValue") or 0):,.2f}</td>'
+                 f'<td class=r style=color:{col}>{pnl:+,.2f}</td></tr>')
+    rows = rows or "<tr><td colspan=5 class=dim>no open positions on-chain</td></tr>"
+    cash_s = f"${cash:,.2f} cash" if cash is not None else "cash: connect to see (goes live with trading)"
+    return (f'<h2>Your wallet — on-chain truth</h2><div class=card>'
+            f'<div style=margin-bottom:6px><b>{cash_s}</b> · ${total:,.2f} in positions'
+            f'{f" · ${cash + total:,.2f} total" if cash is not None else ""}</div>'
+            f'<table><tr><th>market — outcome</th><th class=r>shares</th><th class=r>avg → now</th>'
+            f'<th class=r>value</th><th class=r>pnl $</th></tr>{rows}</table></div>')
 
 
 def _target_rows():
@@ -747,6 +801,7 @@ def render_dyn():
 {errbar}
 {_status_card()}
 {_pending_card()}
+{_wallet_card()}
 <div class=grid>
   <div class=card>
     <h2>Bot — holding</h2>
@@ -893,7 +948,7 @@ class Handler(BaseHTTPRequestHandler):
                 cl = get_client()
                 bal = ""
                 try:
-                    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+                    from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
                     b = cl.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
                     if isinstance(b, dict) and b.get("balance") is not None:
                         bal = f" · balance ${float(b['balance']) / 1e6:,.2f} USDC"
@@ -1020,6 +1075,10 @@ def _check():
     assert "copybot" in html and "Settings" in html and "leaderboard" in html and "Trade history" in html
     dyn = render_dyn()
     assert "Status" in dyn and "Test connection" in dyn and "❌" in dyn  # unconfigured -> red rows
+    assert "Your wallet" in dyn and "no open positions on-chain" in dyn
+    STATE["wallet"] = {"usdc": 28.5, "positions": [{"title": "Q", "outcome": "Yes", "size": 10,
+                       "avgPrice": 0.5, "curPrice": 0.6, "currentValue": 6.0, "cashPnl": 1.0}]}
+    assert "$28.50 cash" in _wallet_card() and "$34.50 total" in _wallet_card()
     print("self-check OK")
 
 
