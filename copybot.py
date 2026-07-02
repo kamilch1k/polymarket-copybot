@@ -20,6 +20,7 @@ RUN
   python copybot.py             start app; browser opens; configure in the page
 """
 import json
+import math
 import os
 import re
 import sys
@@ -40,8 +41,9 @@ COPY_FRACTION = 0.01          # copy 1% of his share size
 MAX_USDC_PER_TRADE = 5.0      # per-copy notional cap
 MIN_NOTIONAL = 1.0            # Polymarket rejects orders under ~$1
 SLIPPAGE = 0.02              # accept up to this much worse than his fill
+MIN_HIS_NOTIONAL = 50.0       # copy his BUY only if he put >= this many $ in (skip his dust)
 MODE = "auto"                 # "auto" = copy instantly · "approve" = queue for your click
-POLL_SECONDS = 15
+POLL_SECONDS = 15             # REST polling is the fallback; WebSocket is the fast path
 LEADERS_EVERY = 20            # refresh leaderboard every N polls (~5 min)
 SIGNATURE_TYPE = 1            # 1 = email/magic login, 2 = browser wallet
 PORT = 8777
@@ -51,6 +53,7 @@ STATE_FILE = Path(__file__).with_name("copybot_state.json")
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
+WS_URL = "wss://ws-live-data.polymarket.com"  # real-time platform activity stream
 # -----------------------------------------------------------------------------
 
 LOCK = threading.Lock()
@@ -62,6 +65,7 @@ STATE = {
 
     "pending": {}, "pid": 0,     # trades awaiting approval (approve mode)
     "history": [],               # every executed copy, persisted
+    "ws": False,                 # realtime feed connected?
 }
 
 
@@ -77,12 +81,16 @@ def my_buy_size(his_size, price, fraction=None, cap=None):
     return round(notional / price, 2)
 
 
-def limit_price(ref_price, side):
-    """Marketable limit: cross the book by SLIPPAGE so the copy fills.
-    ponytail: whole-cent rounding; sub-cent markets need client.get_tick_size()."""
+def limit_price(ref_price, side, tick=0.01):
+    """Marketable limit: cross the book by SLIPPAGE so the copy fills,
+    rounded to the market's tick (aggressive direction) and clamped in-book."""
     if side == "BUY":
-        return min(0.99, round(ref_price * (1 + SLIPPAGE), 2))
-    return max(0.01, round(ref_price * (1 - SLIPPAGE), 2))
+        px = min(1 - tick, ref_price * (1 + SLIPPAGE))
+        px = math.ceil(px / tick - 1e-9) * tick
+        return round(min(px, 1 - tick), 4)
+    px = max(tick, ref_price * (1 - SLIPPAGE))
+    px = math.floor(px / tick + 1e-9) * tick
+    return round(max(px, tick), 4)
 
 
 def key(trade):
@@ -108,6 +116,11 @@ def copy_stats(feed):
                      "Raise the cap or drop the fraction to track him faithfully.")
     else:
         lines.append("✓ cap rarely binds — copies scale with his size. Faithful tracking.")
+    with LOCK:
+        drifts = [e["drift"] for e in STATE["history"] if e.get("drift") is not None]
+    if drifts:
+        lines.append(f"copy lag cost: {sum(drifts) / len(drifts):+.1f}¢/share avg over {len(drifts)} copies "
+                     f"(positive = market moved against you before your copy)")
     return lines
 
 
@@ -142,7 +155,8 @@ def key_wallet(k):
 
 # ---- persistence ------------------------------------------------------------
 def load_config():
-    global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, MODE, PRIVATE_KEY_MEM
+    global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, MODE, \
+        PRIVATE_KEY_MEM, MIN_HIS_NOTIONAL
     if not CONFIG_FILE.exists():
         return
     c = json.loads(CONFIG_FILE.read_text())
@@ -155,6 +169,7 @@ def load_config():
     MAX_USDC_PER_TRADE = c.get("cap", MAX_USDC_PER_TRADE)
     SLIPPAGE = c.get("slippage", SLIPPAGE)
     BANKROLL = c.get("bankroll", BANKROLL)
+    MIN_HIS_NOTIONAL = c.get("min_his", MIN_HIS_NOTIONAL)
     STATE["funder"] = c.get("funder", "")
 
 
@@ -162,7 +177,8 @@ def save_config():
     CONFIG_FILE.write_text(json.dumps({  # includes the key: owner's choice, file is gitignored
         "targets": TARGETS, "funder": STATE.get("funder", ""), "fraction": COPY_FRACTION,
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
-        "mode": MODE, "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
+        "mode": MODE, "min_his": MIN_HIS_NOTIONAL,
+        "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
 
 def load_state():
@@ -208,6 +224,28 @@ def fetch_leaders():
         return []
 
 
+def midpoint(tid):
+    """Current mid price, or None if unavailable (then we trust his fill price)."""
+    try:
+        r = requests.get(f"{CLOB_HOST}/midpoint", params={"token_id": tid}, timeout=5)
+        return float(r.json()["mid"])
+    except Exception:
+        return None
+
+
+TICKS = {}  # token_id -> tick size, cached
+
+
+def tick_of(tid):
+    if tid not in TICKS:
+        try:
+            r = requests.get(f"{CLOB_HOST}/tick-size", params={"token_id": tid}, timeout=5)
+            TICKS[tid] = float(r.json()["minimum_tick_size"])
+        except Exception:
+            return 0.01  # sane default, don't cache failures
+    return TICKS[tid]
+
+
 def fetch_name(addr):
     try:
         r = requests.get(f"{GAMMA_API}/public-profile", params={"address": addr}, timeout=10)
@@ -241,8 +279,8 @@ def get_client():
     return CLIENT
 
 
-def _order(tid, side, shares, ref, name):
-    price = limit_price(ref, side)
+def _order(tid, side, shares, ref, name, drift=None):
+    price = limit_price(ref, side, tick_of(tid))
     with LOCK:
         live = STATE["live"]
         STATE["copies"] += 1
@@ -252,12 +290,15 @@ def _order(tid, side, shares, ref, name):
         try:
             cl = get_client()
             signed = cl.create_order(OrderArgs(token_id=tid, price=price, size=shares, side=side))
-            note = str(cl.post_order(signed, OrderType.GTC))[:80]
+            # FAK = fill what's there right now, cancel the rest — an order that
+            # misses must die, not rest in the book and fill later at a stale price
+            note = str(cl.post_order(signed, OrderType.FAK))[:80]
             kind = "live"
         except Exception as ex:
             kind, note = "error", str(ex)[:140]
     e = {"d": time.strftime("%Y-%m-%d"), "t": time.strftime("%H:%M:%S"), "kind": kind,
-         "side": side, "name": name, "shares": shares, "price": price, "note": note}
+         "side": side, "name": name, "shares": shares, "price": price, "note": note,
+         "drift": drift}
     with LOCK:
         STATE["log"].appendleft(e)
         STATE["history"].append(e)
@@ -275,7 +316,7 @@ def execute(it):
         if shares <= 0:
             logline(kind="skip", side="SELL", name=it["name"], note="nothing left to sell")
             return
-    if _order(tid, side, shares, it["ref"], it["name"]):
+    if _order(tid, side, shares, it["ref"], it["name"], it.get("drift")):
         with LOCK:
             delta = shares if side == "BUY" else -shares
             STATE["holdings"][tid] = round(STATE["holdings"].get(tid, 0.0) + delta, 2)
@@ -305,6 +346,10 @@ def handle(trade):
     with LOCK:
         STATE["names"][tid] = name
     if side == "BUY":
+        if his * price < MIN_HIS_NOTIONAL:
+            logline(kind="skip", side="BUY", name=name,
+                    note=f"his ${his * price:,.0f} < ${MIN_HIS_NOTIONAL:,.0f} conviction floor")
+            return
         shares = my_buy_size(his, price)
         if shares <= 0:
             logline(kind="skip", side="BUY", name=name, note=f"< ${MIN_NOTIONAL} min")
@@ -316,7 +361,20 @@ def handle(trade):
         if shares <= 0 or shares * price < MIN_NOTIONAL:
             logline(kind="skip", side="SELL", name=name, note="nothing copied / dust")
             return
-    submit({"tid": tid, "side": side, "shares": shares, "ref": price, "name": name})
+
+    # pre-flight: check where the market is NOW, not where it was when he traded
+    mid = midpoint(tid)
+    drift = None
+    if mid:
+        drift = round(((mid - price) if side == "BUY" else (price - mid)) * 100, 2)
+        if side == "BUY" and mid > price * (1 + SLIPPAGE):
+            logline(kind="skip", side="BUY", name=name,
+                    note=f"won't chase: mid {mid:.3f} already ran past his {price:.3f}+slippage")
+            return
+        ref = min(price, mid) if side == "BUY" else mid  # never pay above market / always exit at market
+    else:
+        ref = price
+    submit({"tid": tid, "side": side, "shares": shares, "ref": ref, "name": name, "drift": drift})
 
 
 def test_trade():
@@ -334,15 +392,16 @@ def test_trade():
         tid, ref = t["asset"], float(t["price"])
         name = f"TEST · {t.get('title', '?')}"
         from py_clob_client.clob_types import OrderArgs, OrderType
-        buy_px = limit_price(ref, "BUY")
+        tick = tick_of(tid)
+        buy_px = limit_price(ref, "BUY", tick)
         shares = round(MIN_NOTIONAL * 1.1 / buy_px, 2)
         r = cl.post_order(cl.create_order(OrderArgs(token_id=tid, price=buy_px, size=shares, side="BUY")),
-                          OrderType.GTC)
+                          OrderType.FAK)
         logline(kind="live", side="BUY", name=name, shares=shares, price=buy_px, note=str(r)[:70])
-        time.sleep(3)  # let the buy fill before selling it back
-        sell_px = limit_price(ref, "SELL")
+        time.sleep(3)  # let the buy settle before selling it back
+        sell_px = limit_price(ref, "SELL", tick)
         r = cl.post_order(cl.create_order(OrderArgs(token_id=tid, price=sell_px, size=shares, side="SELL")),
-                          OrderType.GTC)
+                          OrderType.FAK)
         logline(kind="live", side="SELL", name=name, shares=shares, price=sell_px, note=str(r)[:70])
         with LOCK:
             STATE["conn"] = (True, "✓ test trade round-trip sent — see activity log for both fills")
@@ -363,6 +422,62 @@ def try_go_live(source):
         logline(kind="live", note=f"auto-live: trading enabled ({source})")
     except Exception as ex:
         logline(kind="error", note=f"auto-live failed ({source}): {str(ex)[:120]}")
+
+
+def ws_loop():
+    """Real-time path: stream every platform trade, act on our targets' ones
+    in <1s instead of waiting for the next poll. REST polling stays running
+    underneath as reconciliation + fallback (same seen-keys, so no doubles)."""
+    try:
+        import websocket
+    except ImportError:
+        logline(kind="error", note="websocket-client not installed — realtime off, polling only")
+        return
+
+    def on_open(ws):
+        with LOCK:
+            STATE["ws"] = True
+        ws.send(json.dumps({"action": "subscribe",
+                            "subscriptions": [{"topic": "activity", "type": "trades"}]}))
+
+    def on_message(ws, raw):
+        try:
+            m = json.loads(raw)
+        except ValueError:
+            return
+        for msg in (m if isinstance(m, list) else [m]):
+            if not isinstance(msg, dict) or msg.get("topic") != "activity":
+                continue
+            p = msg.get("payload") or {}
+            for t in (p if isinstance(p, list) else [p]):
+                if not all(k in t for k in ("transactionHash", "asset", "side", "price", "size")):
+                    continue
+                wallet = str(t.get("proxyWallet", "")).lower()
+                match = next((a for a in TARGETS if a.lower() == wallet), None)
+                if not match:
+                    continue
+                k = key(t)
+                with LOCK:
+                    if k in STATE["seen"] or match not in STATE["baselined"]:
+                        continue  # dupe, or first poll hasn't baselined this target yet
+                    STATE["seen"].add(k)
+                handle(t)
+                save_state()
+
+    def on_down(ws, *a):
+        with LOCK:
+            STATE["ws"] = False
+
+    while True:
+        try:
+            websocket.WebSocketApp(WS_URL, on_open=on_open, on_message=on_message,
+                                   on_error=on_down, on_close=on_down
+                                   ).run_forever(ping_interval=25, ping_timeout=10)
+        except Exception:
+            pass
+        with LOCK:
+            STATE["ws"] = False
+        time.sleep(5)  # reconnect backoff
 
 
 def bot_loop():
@@ -497,6 +612,9 @@ def _status_card():
          tgt_label or "paste an address in Settings, or click copy on the leaderboard below"),
         ("Watching their trades (data feed)", feed_ok,
          "live" if feed_ok else "waiting for first poll — needs a target set"),
+        ("Real-time feed (WebSocket)", STATE["ws"],
+         "connected — copies land in under a second" if STATE["ws"]
+         else "reconnecting… polling covers the gap (15s worst case)"),
         ("Funder wallet", funder_ok, "saved" if funder_ok else "paste your Polymarket deposit address in Settings"),
         ("Private key", key_ok,
          f"✓ verified real — signs as {signer}" if key_ok else "paste it in Settings"),
@@ -565,6 +683,7 @@ def _settings_form():
   </select></label>
   <label>Copy fraction<input name=fraction value="{COPY_FRACTION}"></label>
   <label>Max $ / trade<input name=cap value="{MAX_USDC_PER_TRADE}"></label>
+  <label>Copy his BUY only if ≥ $<input name=min_his value="{MIN_HIS_NOTIONAL}"></label>
   <label>Slippage<input name=slippage value="{SLIPPAGE}"></label>
   <label>Bankroll $<input name=bankroll value="{BANKROLL}"></label>
   <button class=save type=submit>Save</button>
@@ -712,7 +831,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, render())
 
     def do_POST(self):
-        global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, PRIVATE_KEY_MEM, MODE, CLIENT
+        global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, \
+            PRIVATE_KEY_MEM, MODE, CLIENT, MIN_HIS_NOTIONAL
         path = urlparse(self.path).path
         body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)).decode()
         f = parse_qs(body)
@@ -805,6 +925,7 @@ class Handler(BaseHTTPRequestHandler):
                 MODE = m
             COPY_FRACTION = num("fraction", COPY_FRACTION)
             MAX_USDC_PER_TRADE = num("cap", MAX_USDC_PER_TRADE)
+            MIN_HIS_NOTIONAL = num("min_his", MIN_HIS_NOTIONAL)
             SLIPPAGE = num("slippage", SLIPPAGE)
             BANKROLL = num("bankroll", BANKROLL)
             save_config()
@@ -820,11 +941,16 @@ class Handler(BaseHTTPRequestHandler):
 
 # ---- entry ------------------------------------------------------------------
 def _check():
+    globals()["midpoint"] = lambda tid: None  # offline: no live mid / tick lookups
+    globals()["tick_of"] = lambda tid: 0.01
     assert my_buy_size(1000, 0.50, 0.01, 50) == 10.0
     assert my_buy_size(1000, 0.50, 0.01, 3) == 6.0
     assert my_buy_size(10, 0.50, 0.01, 50) == 0.0
     assert limit_price(0.50, "BUY") == 0.51
     assert limit_price(0.50, "SELL") == 0.49
+    assert limit_price(0.99, "BUY") == 0.99
+    assert limit_price(0.505, "BUY", 0.001) == 0.516   # sub-cent tick honored
+    assert limit_price(0.505, "SELL", 0.001) == 0.494
     assert not ready()  # nothing configured
     global MODE
     STATE["live"] = False
@@ -840,6 +966,19 @@ def _check():
     execute(STATE["pending"].popitem()[1])
     assert STATE["holdings"]["t2"] == 10.0
     MODE = "auto"
+    # conviction floor: his $25 buy is dust, skipped
+    handle({"asset": "t3", "side": "BUY", "price": 0.5, "size": 50, "title": "Q3", "outcome": "Yes"})
+    assert "conviction" in STATE["log"][0]["note"] and STATE["holdings"].get("t3") is None
+    # pre-flight: refuse to chase a run-away price
+    globals()["midpoint"] = lambda tid: 0.60
+    handle({"asset": "t4", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q4", "outcome": "Yes"})
+    assert "won't chase" in STATE["log"][0]["note"] and STATE["holdings"].get("t4") is None
+    # pre-flight: mid below his fill -> copy at the better (market) price, drift recorded
+    globals()["midpoint"] = lambda tid: 0.48
+    handle({"asset": "t5", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q5", "outcome": "Yes"})
+    assert STATE["holdings"]["t5"] > 0 and STATE["history"][-1]["drift"] == -2.0
+    assert STATE["history"][-1]["price"] == limit_price(0.48, "BUY")  # priced off mid, not his fill
+    globals()["midpoint"] = lambda tid: None
     assert any("1 buys" in x for x in copy_stats([{"side": "BUY", "size": 100, "price": 0.5}]))
     a1, a2 = "0x" + "1" * 40, "0x" + "2" * 40
     assert parse_targets(f"{a1}, {a2} garbage 0xshort") == [a1, a2]
@@ -867,6 +1006,7 @@ if __name__ == "__main__":
         load_config()
         load_state()
         threading.Thread(target=bot_loop, daemon=True).start()
+        threading.Thread(target=ws_loop, daemon=True).start()
         threading.Thread(target=server.serve_forever, daemon=True).start()
         print(f"copybot: {url}")
     try:
