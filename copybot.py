@@ -423,7 +423,7 @@ def _settings_form():
 <form method=post action=/settings class=settings>
   <label>Target wallet<input name=target value="{TARGET}" placeholder="0x… (or click a leaderboard trader)"></label>
   <label>Funder wallet (your deposit address)<input name=funder value="{funder_val}" placeholder="0x…"></label>
-  <label>Private key — {pk_status}<input name=private_key type=password autocomplete=off placeholder="paste to set · blank keeps current"></label>
+  <label>Private key — {pk_status}<input name=private_key type=text autocomplete=off placeholder="paste to set · blank keeps current"></label>
   <label>Mode<select name=mode>
     <option value=auto {"selected" if MODE == "auto" else ""}>auto — copy instantly</option>
     <option value=approve {"selected" if MODE == "approve" else ""}>approve — I click ✓ per trade</option>
@@ -473,7 +473,9 @@ def render():
     lrows = lrows or "<tr><td colspan=6 class=dim>waiting…</td></tr>"
     stats = "".join(f"<li>{s}</li>" for s in copy_stats(feed))
     errbar = f'<div class=err>{err}</div>' if err else ""
-    tlabel = ((tname + " · " if tname else "") + (TARGET[:6] + "…" + TARGET[-4:])) if TARGET else "none set"
+    tlabel = ((tname + " · " if tname else "") + TARGET) if TARGET else "none set"
+    funder = STATE.get("funder") or os.environ.get("PM_FUNDER", "")
+    funder_chip = f'<span class="tag dim">funder {funder}</span>' if funder else ""
 
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <meta http-equiv=refresh content=3><title>copybot</title><style>
@@ -504,6 +506,7 @@ details.cfg summary{{cursor:pointer;font-weight:700}}
 <div class=bar>
   <span class=pill>{pill}</span>
   <span class="tag dim">target {tlabel}</span>
+  {funder_chip}
   <span class="tag dim">copies {copies}</span>
   <span class="tag dim">up {up // 3600}h{up % 3600 // 60}m</span>
   <span class="tag dim">polled {age}</span>
