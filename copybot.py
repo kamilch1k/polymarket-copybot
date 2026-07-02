@@ -612,6 +612,9 @@ def render_dyn():
 <div class=card><table><tr><th>time</th><th>kind</th><th>side</th><th>market — outcome</th><th class=r>size</th><th>note</th></tr>{lrows}</table></div>"""
 
 
+BUILD = time.strftime("%Y-%m-%d %H:%M", time.localtime(Path(__file__).stat().st_mtime))
+
+
 def render():
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <title>copybot</title><style>
@@ -637,7 +640,7 @@ details.cfg summary{{cursor:pointer;font-weight:700}}
 .settings input,.settings select{{background:#0b0f17;border:1px solid #334155;border-radius:6px;color:#e5e7eb;padding:6px 8px;font:inherit}}
 .settings button{{grid-column:1/-1;justify-self:start}}
 </style></head><body>
-<h1>Polymarket copybot</h1>
+<h1>Polymarket copybot <span class=dim style=font-weight:400>build {BUILD}</span></h1>
 {_settings_form()}
 <div id=dyn>{render_dyn()}</div>
 <script>
