@@ -850,7 +850,7 @@ def _wallet_card():
             cash_s += f" (${tradeable:,.2f} tradeable on CLOB)"
     total_s = f" · ${cash + total:,.2f} total" if cash is not None else ""
     warn = ""
-    if cash == 0 and not pos:
+    if cash is not None and (cash + total) < 1.0:  # no cash and no live value, ignoring dead $0 dust
         warn = ('<div class=err style="margin-top:6px">This wallet is empty on-chain. '
                 'If Polymarket shows a balance, your money is on a different address than the funder above — '
                 'open Polymarket → Deposit, copy that exact 0x address into the Funder field, and use its exported key.</div>')
