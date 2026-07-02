@@ -45,6 +45,7 @@ MAX_USDC_PER_TRADE = 5.0      # per-copy notional cap
 MIN_NOTIONAL = 1.0            # Polymarket rejects orders under ~$1
 SLIPPAGE = 0.02              # accept up to this much worse than his fill
 MIN_HIS_NOTIONAL = 50.0       # copy his BUY only if he put >= this many $ in (skip his dust)
+SPEND_CAP = 20.0              # hard stop: total live BUY $ the bot may ever spend (sells always allowed)
 MODE = "auto"                 # "auto" = copy instantly · "approve" = queue for your click
 POLL_SECONDS = 15             # REST polling is the fallback; WebSocket is the fast path
 LEADERS_EVERY = 20            # refresh leaderboard every N polls (~5 min)
@@ -77,6 +78,7 @@ STATE = {
     "wallet": {},                # on-chain truth: usdc cash + open positions
     "chat": deque(maxlen=30),    # conversation with the in-bot Claude copilot
     "thinking": False,           # a Claude request is in flight
+    "spent_live": 0.0,           # cumulative $ of LIVE buys, enforced against SPEND_CAP
 }
 
 
@@ -182,6 +184,7 @@ def load_config():
     BANKROLL = c.get("bankroll", BANKROLL)
     MIN_HIS_NOTIONAL = c.get("min_his", MIN_HIS_NOTIONAL)
     SIGNATURE_TYPE = c.get("sig_type", SIGNATURE_TYPE)
+    globals()["SPEND_CAP"] = c.get("spend_cap", SPEND_CAP)
     STATE["funder"] = c.get("funder", "")
 
 
@@ -190,7 +193,7 @@ def save_config():
         "targets": TARGETS, "funder": STATE.get("funder", ""), "fraction": COPY_FRACTION,
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
         "mode": MODE, "min_his": MIN_HIS_NOTIONAL, "sig_type": SIGNATURE_TYPE,
-        "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
+        "spend_cap": SPEND_CAP, "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
 
 def load_state():
@@ -201,12 +204,14 @@ def load_state():
     STATE["holdings"] = s.get("holdings", {})
     STATE["names"] = s.get("names", {})
     STATE["history"] = s.get("history", [])
+    STATE["spent_live"] = s.get("spent_live", 0.0)
 
 
 def save_state():
     with LOCK:
         data = {"seen": sorted(STATE["seen"]), "holdings": STATE["holdings"],
-                "names": STATE["names"], "history": STATE["history"][-500:]}
+                "names": STATE["names"], "history": STATE["history"][-500:],
+                "spent_live": STATE["spent_live"]}
     STATE_FILE.write_text(json.dumps(data))
 
 
@@ -372,11 +377,21 @@ def get_client():
     return CLIENT
 
 
+def over_budget(notional):
+    """True when a live BUY of `notional` $ would break the hard spend cap."""
+    with LOCK:
+        return STATE["spent_live"] + notional > SPEND_CAP + 1e-9
+
+
 def _order(tid, side, shares, ref, name, drift=None):
     price = limit_price(ref, side, tick_of(tid))
     with LOCK:
         live = STATE["live"]
         STATE["copies"] += 1
+    if live and side == "BUY" and over_budget(price * shares):
+        logline(kind="skip", side="BUY", name=name,
+                note=f"HARD STOP: ${STATE['spent_live']:.2f} of ${SPEND_CAP:.2f} budget spent")
+        return False
     kind, note = "dry", ""
     if live:
         from py_clob_client_v2.clob_types import OrderArgs, OrderType
@@ -387,6 +402,9 @@ def _order(tid, side, shares, ref, name, drift=None):
             # misses must die, not rest in the book and fill later at a stale price
             note = str(cl.post_order(signed, OrderType.FAK))[:80]
             kind = "live"
+            if side == "BUY":
+                with LOCK:
+                    STATE["spent_live"] = round(STATE["spent_live"] + price * shares, 2)
         except Exception as ex:
             kind, note = "error", str(ex)[:140]
     e = {"d": time.strftime("%Y-%m-%d"), "t": time.strftime("%H:%M:%S"), "kind": kind,
@@ -1001,6 +1019,7 @@ def _settings_form():
   <label>Copy fraction<input name=fraction value="{COPY_FRACTION}"></label>
   <label>Max $ / trade<input name=cap value="{MAX_USDC_PER_TRADE}"></label>
   <label>Copy his BUY only if ≥ $<input name=min_his value="{MIN_HIS_NOTIONAL}"></label>
+  <label>Hard stop: total live buys ≤ $<input name=spend_cap value="{SPEND_CAP}"></label>
   <label>Slippage<input name=slippage value="{SLIPPAGE}"></label>
   <label>Bankroll $<input name=bankroll value="{BANKROLL}"></label>
   <button class=save type=submit>Save</button>
@@ -1054,6 +1073,7 @@ def render_dyn():
   <span class="tag dim">target {tlabel}</span>
   {funder_chip}
   <span class="tag dim">copies {copies}</span>
+  <span class="tag" style="color:#fbbf24">budget ${STATE["spent_live"]:.2f} / ${SPEND_CAP:.2f}</span>
   <span class="tag dim">up {up // 3600}h{up % 3600 // 60}m</span>
   <span class="tag dim">polled {age}</span>
   {toggle}
@@ -1283,6 +1303,7 @@ class Handler(BaseHTTPRequestHandler):
             COPY_FRACTION = num("fraction", COPY_FRACTION)
             MAX_USDC_PER_TRADE = num("cap", MAX_USDC_PER_TRADE)
             MIN_HIS_NOTIONAL = num("min_his", MIN_HIS_NOTIONAL)
+            globals()["SPEND_CAP"] = num("spend_cap", SPEND_CAP)
             SLIPPAGE = num("slippage", SLIPPAGE)
             BANKROLL = num("bankroll", BANKROLL)
             save_config()
@@ -1355,6 +1376,10 @@ def _check():
     assert apply_actions([{"op": "rm -rf", "value": 1}, "junk"]) == []  # non-whitelisted ignored
     assert parse_actions("no control line at all")[1] == []
     assert json.dumps(bot_context())  # snapshot is JSON-serializable
+    # hard spend cap arithmetic
+    STATE["spent_live"], globals()["SPEND_CAP"] = 19.50, 20.0
+    assert not over_budget(0.49) and over_budget(0.51)
+    STATE["spent_live"] = 0.0
     page = render()
     assert "copybot" in page and "Settings" in page and "leaderboard" in page and "Trade history" in page
     assert "Ask Claude" in page and "action=/ask" in page
