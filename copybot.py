@@ -319,6 +319,39 @@ def handle(trade):
     submit({"tid": tid, "side": side, "shares": shares, "ref": price, "name": name})
 
 
+def test_trade():
+    """Real-money end-to-end proof: buy ~$1 of the most recent market a target
+    touched, then immediately sell it back. Costs a few cents of spread.
+    ponytail: $0.10 isn't possible — Polymarket rejects orders under $1 notional."""
+    try:
+        cl = get_client()
+        with LOCK:
+            feed = list(STATE["target_feed"])
+        t = next((x for x in feed if x.get("side")), None)
+        if not t:
+            logline(kind="error", note="test trade: no target activity seen yet — wait for a poll")
+            return
+        tid, ref = t["asset"], float(t["price"])
+        name = f"TEST · {t.get('title', '?')}"
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        buy_px = limit_price(ref, "BUY")
+        shares = round(MIN_NOTIONAL * 1.1 / buy_px, 2)
+        r = cl.post_order(cl.create_order(OrderArgs(token_id=tid, price=buy_px, size=shares, side="BUY")),
+                          OrderType.GTC)
+        logline(kind="live", side="BUY", name=name, shares=shares, price=buy_px, note=str(r)[:70])
+        time.sleep(3)  # let the buy fill before selling it back
+        sell_px = limit_price(ref, "SELL")
+        r = cl.post_order(cl.create_order(OrderArgs(token_id=tid, price=sell_px, size=shares, side="SELL")),
+                          OrderType.GTC)
+        logline(kind="live", side="SELL", name=name, shares=shares, price=sell_px, note=str(r)[:70])
+        with LOCK:
+            STATE["conn"] = (True, "✓ test trade round-trip sent — see activity log for both fills")
+    except Exception as ex:
+        with LOCK:
+            STATE["conn"] = (False, f"test trade failed: {str(ex)[:140]}")
+        logline(kind="error", note=f"test trade: {str(ex)[:140]}")
+
+
 def try_go_live(source):
     """Auto-enable live trading when fully configured (owner wants hands-off)."""
     if STATE["live"] or not ready():
@@ -475,7 +508,10 @@ def _status_card():
         for what, ok, detail in items)
     return (f'<div class=card style=margin-bottom:16px><h2 style=margin-top:0>Status — what\'s left to make it trade</h2>'
             f'<table>{rows}</table>'
-            f'<form method=post action=/test style=display:inline><button class=copy>Test connection</button></form>'
+            f'<form method=post action=/test style=display:inline><button class=copy>Test connection</button></form> '
+            f'<form method=post action=/testtrade style=display:inline '
+            f'onsubmit="return confirm(\'Places a REAL ~$1 buy and sells it right back. Costs a few cents. Go?\')">'
+            f'<button class=copy>Test trade (~$1 round trip)</button></form>'
             f'</div>')
 
 
@@ -720,6 +756,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as ex:
                 with LOCK:
                     STATE["conn"] = (False, str(ex)[:160])
+        elif path == "/testtrade":
+            threading.Thread(target=test_trade, daemon=True).start()
         elif path == "/approve":
             pid = f.get("id", [""])[0]
             with LOCK:
