@@ -21,6 +21,7 @@ RUN
 """
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -120,9 +121,23 @@ def parse_targets(text):
     """Comma/space-separated 0x addresses -> validated list."""
     out = []
     for a in text.replace(",", " ").split():
-        if a.startswith("0x") and len(a) == 42 and a not in out:
+        if valid_addr(a) and a not in out:
             out.append(a)
     return out
+
+
+def valid_addr(a):
+    return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", a or ""))
+
+
+def key_wallet(k):
+    """Cryptographic proof the key is real: derive the address it signs as.
+    Empty string = not a usable key."""
+    try:
+        from eth_account import Account
+        return Account.from_key(k).address
+    except Exception:
+        return ""
 
 
 # ---- persistence ------------------------------------------------------------
@@ -304,7 +319,21 @@ def handle(trade):
     submit({"tid": tid, "side": side, "shares": shares, "ref": price, "name": name})
 
 
+def try_go_live(source):
+    """Auto-enable live trading when fully configured (owner wants hands-off)."""
+    if STATE["live"] or not ready():
+        return
+    try:
+        get_client()
+        with LOCK:
+            STATE["live"] = True
+        logline(kind="live", note=f"auto-live: trading enabled ({source})")
+    except Exception as ex:
+        logline(kind="error", note=f"auto-live failed ({source}): {str(ex)[:120]}")
+
+
 def bot_loop():
+    try_go_live("startup")
     polls = 0
     while True:
         if polls % LEADERS_EVERY == 0:  # leaderboard loads even before a target is set
@@ -423,8 +452,9 @@ def _status_card():
     with LOCK:
         last, conn, live = STATE["last_poll"], STATE["conn"], STATE["live"]
         tnames = dict(STATE["tnames"])
-    key_ok = bool(PRIVATE_KEY_MEM or os.environ.get("PM_PRIVATE_KEY"))
-    funder_ok = bool(STATE.get("funder") or os.environ.get("PM_FUNDER"))
+    signer = key_wallet(PRIVATE_KEY_MEM or os.environ.get("PM_PRIVATE_KEY", ""))
+    key_ok = bool(signer)
+    funder_ok = valid_addr(STATE.get("funder") or os.environ.get("PM_FUNDER", ""))
     feed_ok = bool(last and time.time() - last < POLL_SECONDS * 3)
     tgt_label = ", ".join(tnames.get(a, a[:8] + "…") for a in TARGETS)
     conn_ok = bool(conn and conn[0])
@@ -436,7 +466,7 @@ def _status_card():
          "live" if feed_ok else "waiting for first poll — needs a target set"),
         ("Funder wallet", funder_ok, "saved" if funder_ok else "paste your Polymarket deposit address in Settings"),
         ("Private key", key_ok,
-         "saved to disk — survives restarts" if key_ok else "paste it in Settings"),
+         f"✓ verified real — signs as {signer}" if key_ok else "paste it in Settings"),
         ("Polymarket trading connection", conn_ok, conn_msg),
         ("Live trading", live, "ON — copying for real" if live else "OFF — click Go LIVE once everything above is ✓"),
     ]
@@ -472,16 +502,27 @@ def _leader_rows():
     return out or "<tr><td colspan=4 class=dim>leaderboard loading…</td></tr>"
 
 
+def _vstyle(value, ok):
+    """Green border = present and verified real. Red = present but bad."""
+    if not value:
+        return ""
+    return "style=border-color:#16a34a;border-width:2px" if ok \
+        else "style=border-color:#dc2626;border-width:2px"
+
+
 def _settings_form():
     is_ready = ready()
     pk_val = PRIVATE_KEY_MEM or os.environ.get("PM_PRIVATE_KEY", "")
     funder_val = STATE.get("funder", "") or os.environ.get("PM_FUNDER", "")
+    signer = key_wallet(pk_val)
+    key_note = (f' — <span style=color:#4ade80>✓ real key, signs as {signer}</span>' if signer
+                else (' — <span style=color:#f87171>✗ not a valid key</span>' if pk_val else ""))
     return f"""<div class=card style=margin-bottom:16px>
 <h2 style=margin-top:0>⚙ Settings {'· ✅ ready' if is_ready else '· ⚠ setup needed'}</h2>
 <form method=post action=/settings class=settings>
-  <label>Target wallet(s) — comma-separate for several<input name=target value="{', '.join(TARGETS)}" placeholder="0x…, 0x… (or click copy on leaderboard traders)"></label>
-  <label>Funder wallet (your deposit address)<input name=funder value="{funder_val}" placeholder="0x…"></label>
-  <label>Private key (saved to copybot_config.json on this PC)<input name=private_key value="{pk_val}" autocomplete=off placeholder="0x…"></label>
+  <label>Target wallet(s) — comma-separate for several<input name=target value="{', '.join(TARGETS)}" {_vstyle(TARGETS, True)} placeholder="0x…, 0x… (or click copy on leaderboard traders)"></label>
+  <label>Funder wallet (your deposit address)<input name=funder value="{funder_val}" {_vstyle(funder_val, valid_addr(funder_val))} placeholder="0x…"></label>
+  <label>Private key (saved to copybot_config.json on this PC){key_note}<input name=private_key value="{pk_val}" {_vstyle(pk_val, bool(signer))} autocomplete=off placeholder="0x…"></label>
   <label>Mode<select name=mode>
     <option value=auto {"selected" if MODE == "auto" else ""}>auto — copy instantly</option>
     <option value=approve {"selected" if MODE == "approve" else ""}>approve — I click ✓ per trade</option>
@@ -726,6 +767,7 @@ class Handler(BaseHTTPRequestHandler):
             SLIPPAGE = num("slippage", SLIPPAGE)
             BANKROLL = num("bankroll", BANKROLL)
             save_config()
+            try_go_live("settings saved")  # fully configured -> start trading immediately
         elif path == "/kill":
             self._send(200, "bye")
             os._exit(0)  # ponytail: abrupt, but it's a side-project button
@@ -760,6 +802,9 @@ def _check():
     assert any("1 buys" in x for x in copy_stats([{"side": "BUY", "size": 100, "price": 0.5}]))
     a1, a2 = "0x" + "1" * 40, "0x" + "2" * 40
     assert parse_targets(f"{a1}, {a2} garbage 0xshort") == [a1, a2]
+    assert valid_addr(a1) and not valid_addr("0xZZ") and not valid_addr("")
+    assert key_wallet("0x" + "11" * 32).startswith("0x")  # any 32-byte scalar is a key
+    assert key_wallet("junk") == "" and key_wallet("") == ""
     html = render()
     assert "copybot" in html and "Settings" in html and "leaderboard" in html and "Trade history" in html
     dyn = render_dyn()
