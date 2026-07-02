@@ -53,6 +53,7 @@ PORT = 8777
 PRIVATE_KEY_MEM = None        # persisted to config by owner's choice (single-user PC)
 CONFIG_FILE = Path(__file__).with_name("copybot_config.json")
 STATE_FILE = Path(__file__).with_name("copybot_state.json")
+CHAT_FILE = Path(__file__).with_name("copybot_chat.jsonl")  # persisted Claude copilot log
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -575,11 +576,36 @@ def apply_actions(acts):
     return applied
 
 
+def chat_add(who, text):
+    """Append one copilot message to the in-memory log AND to disk (jsonl)."""
+    entry = {"who": who, "text": text, "t": time.strftime("%Y-%m-%d %H:%M:%S")}
+    with LOCK:
+        STATE["chat"].append(entry)
+    try:
+        with CHAT_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def load_chat():
+    if not CHAT_FILE.exists():
+        return
+    try:
+        for ln in CHAT_FILE.read_text(encoding="utf-8").splitlines()[-30:]:
+            try:
+                STATE["chat"].append(json.loads(ln))
+            except ValueError:
+                pass
+    except Exception:
+        pass
+
+
 def ask_claude(q):
     with LOCK:
         STATE["thinking"] = True
         history = "\n".join(f"{m['who']}: {m['text'][:400]}" for m in list(STATE["chat"])[-6:])
-        STATE["chat"].append({"who": "you", "text": q})
+    chat_add("you", q)
     try:
         exe = shutil.which("claude")
         if not exe:
@@ -611,14 +637,11 @@ OWNER: {q}"""
         applied = apply_actions(acts)
         if applied:
             reply += ("\n\n⚙ applied: " + ", ".join(applied))
-        with LOCK:
-            STATE["chat"].append({"who": "claude", "text": reply or "(empty reply)"})
+        chat_add("claude", reply or "(empty reply)")
     except subprocess.TimeoutExpired:
-        with LOCK:
-            STATE["chat"].append({"who": "claude", "text": "(timed out after 240s — try again)"})
+        chat_add("claude", "(timed out after 240s — try again)")
     except Exception as ex:
-        with LOCK:
-            STATE["chat"].append({"who": "claude", "text": f"(error: {str(ex)[:200]})"})
+        chat_add("claude", f"(error: {str(ex)[:200]})")
     finally:
         with LOCK:
             STATE["thinking"] = False
@@ -933,7 +956,7 @@ def _settings_form():
   <label>Target wallet(s) — comma-separate for several<input name=target value="{', '.join(TARGETS)}" {_vstyle(TARGETS, True)} placeholder="0x…, 0x… (or click copy on leaderboard traders)"></label>
   <label>Funder wallet (your deposit address)<input name=funder value="{funder_val}" {_vstyle(funder_val, valid_addr(funder_val))} placeholder="0x…"></label>
   <label>Private key (saved to copybot_config.json on this PC){key_note}<input name=private_key value="{pk_val}" {_vstyle(pk_val, bool(signer))} autocomplete=off placeholder="0x…"></label>
-  <label>Mode<select name=mode>
+  <label>Mode (saves the instant you switch)<select name=mode onchange="this.form.submit()">
     <option value=auto {"selected" if MODE == "auto" else ""}>auto — copy instantly</option>
     <option value=approve {"selected" if MODE == "approve" else ""}>approve — I click ✓ per trade</option>
   </select></label>
@@ -1240,6 +1263,7 @@ def _check():
     # never touch the real config/state during self-checks (they hold live creds)
     globals()["CONFIG_FILE"] = Path(os.environ.get("TEMP", ".")) / "copybot_check_config.json"
     globals()["STATE_FILE"] = Path(os.environ.get("TEMP", ".")) / "copybot_check_state.json"
+    globals()["CHAT_FILE"] = Path(os.environ.get("TEMP", ".")) / "copybot_check_chat.jsonl"
     globals()["midpoint"] = lambda tid: None  # offline: no live mid / tick lookups
     globals()["tick_of"] = lambda tid: 0.01
     assert my_buy_size(1000, 0.50, 0.01, 50) == 10.0
@@ -1296,6 +1320,12 @@ def _check():
     page = render()
     assert "copybot" in page and "Settings" in page and "leaderboard" in page and "Trade history" in page
     assert "Ask Claude" in page and "action=/ask" in page
+    # chat persistence round-trips through disk
+    chat_add("you", "does the chat save?")
+    STATE["chat"].clear()
+    load_chat()
+    assert any(m["text"] == "does the chat save?" for m in STATE["chat"])
+    CHAT_FILE.unlink(missing_ok=True)
     dyn = render_dyn()
     assert "Status" in dyn and "Test connection" in dyn and "❌" in dyn  # unconfigured -> red rows
     assert "Your wallet" in dyn and "no open positions on-chain" in dyn
@@ -1321,6 +1351,7 @@ if __name__ == "__main__":
     if server:
         load_config()
         load_state()
+        load_chat()
         threading.Thread(target=bot_loop, daemon=True).start()
         threading.Thread(target=ws_loop, daemon=True).start()
         threading.Thread(target=server.serve_forever, daemon=True).start()
