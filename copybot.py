@@ -58,6 +58,8 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 WS_URL = "wss://ws-live-data.polymarket.com"  # real-time platform activity stream
 CLAUDE_MODEL = "claude-opus-4-8"  # runs on the owner's Claude CLI login (Max plan)
+USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # Polymarket collateral (bridged USDC.e on Polygon)
+POLYGON_RPCS = ["https://polygon-bor-rpc.publicnode.com", "https://polygon-rpc.com"]
 # -----------------------------------------------------------------------------
 
 LOCK = threading.Lock()
@@ -253,13 +255,31 @@ def tick_of(tid):
     return TICKS[tid]
 
 
+def onchain_usdc(addr):
+    """USDC.e balance straight from Polygon (no auth, authoritative). None on failure.
+    This is the ground truth for 'how much cash is in this wallet'."""
+    if not valid_addr(addr):
+        return None
+    data = "0x70a08231" + addr[2:].lower().rjust(64, "0")  # balanceOf(addr)
+    for rpc in POLYGON_RPCS:
+        try:
+            r = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                              "params": [{"to": USDC_E, "data": data}, "latest"]}, timeout=8).json()
+            if r.get("result"):
+                return int(r["result"], 16) / 1e6
+        except Exception:
+            continue
+    return None
+
+
 def fetch_wallet():
-    """On-chain truth for YOUR account: open positions (public data-api) and
-    USDC cash (CLOB, only when the trading client is connected)."""
+    """On-chain truth for YOUR funder wallet: cash (direct Polygon query) and open
+    positions (public data-api). Shows the exact address checked so a wrong-wallet
+    setup is visible instead of a silent $0."""
     funder = STATE.get("funder") or os.environ.get("PM_FUNDER")
     if not funder:
         return
-    w = {}
+    w = {"checked": funder, "usdc": onchain_usdc(funder)}
     try:
         pos = requests.get(f"{DATA_API}/positions", params={"user": funder, "limit": 50},
                            timeout=15).json()
@@ -267,17 +287,16 @@ def fetch_wallet():
             w["positions"] = [p for p in pos if float(p.get("size") or 0) > 0][:30]
     except Exception:
         pass
-    try:
+    try:  # CLOB "tradeable" balance, if connected — may differ from on-chain (open orders)
         if CLIENT:
             from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
             b = CLIENT.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
             if isinstance(b, dict) and b.get("balance") is not None:
-                w["usdc"] = float(b["balance"]) / 1e6
+                w["tradeable"] = float(b["balance"]) / 1e6
     except Exception:
         pass
-    if w:
-        with LOCK:
-            STATE["wallet"].update(w)
+    with LOCK:
+        STATE["wallet"].update(w)
 
 
 def fetch_name(addr):
@@ -798,12 +817,25 @@ def _wallet_card():
                  f'<td class=r>${float(p.get("currentValue") or 0):,.2f}</td>'
                  f'<td class=r style=color:{col}>{pnl:+,.2f}</td></tr>')
     rows = rows or "<tr><td colspan=5 class=dim>no open positions on-chain</td></tr>"
-    cash_s = f"${cash:,.2f} cash" if cash is not None else "cash: connect to see (goes live with trading)"
+    checked = w.get("checked", "")
+    tradeable = w.get("tradeable")
+    if cash is None:
+        cash_s = "cash: couldn't read chain (retrying)"
+    else:
+        cash_s = f"${cash:,.2f} USDC cash"
+        if tradeable is not None and abs(tradeable - cash) > 0.01:
+            cash_s += f" (${tradeable:,.2f} tradeable on CLOB)"
+    total_s = f" · ${cash + total:,.2f} total" if cash is not None else ""
+    warn = ""
+    if cash == 0 and not pos:
+        warn = ('<div class=err style="margin-top:6px">This wallet is empty on-chain. '
+                'If Polymarket shows a balance, your money is on a different address than the funder above — '
+                'open Polymarket → Deposit, copy that exact 0x address into the Funder field, and use its exported key.</div>')
     return (f'<h2>Your wallet — on-chain truth</h2><div class=card>'
-            f'<div style=margin-bottom:6px><b>{cash_s}</b> · ${total:,.2f} in positions'
-            f'{f" · ${cash + total:,.2f} total" if cash is not None else ""}</div>'
+            f'<div style=margin-bottom:4px><b>{cash_s}</b> · ${total:,.2f} in positions{total_s}</div>'
+            f'<div class=dim style="font-size:11px;margin-bottom:6px">checking {checked}</div>'
             f'<table><tr><th>market — outcome</th><th class=r>shares</th><th class=r>avg → now</th>'
-            f'<th class=r>value</th><th class=r>pnl $</th></tr>{rows}</table></div>')
+            f'<th class=r>value</th><th class=r>pnl $</th></tr>{rows}</table>{warn}</div>')
 
 
 def _target_rows():
@@ -1267,9 +1299,12 @@ def _check():
     dyn = render_dyn()
     assert "Status" in dyn and "Test connection" in dyn and "❌" in dyn  # unconfigured -> red rows
     assert "Your wallet" in dyn and "no open positions on-chain" in dyn
-    STATE["wallet"] = {"usdc": 28.5, "positions": [{"title": "Q", "outcome": "Yes", "size": 10,
-                       "avgPrice": 0.5, "curPrice": 0.6, "currentValue": 6.0, "cashPnl": 1.0}]}
-    assert "$28.50 cash" in _wallet_card() and "$34.50 total" in _wallet_card()
+    STATE["wallet"] = {"usdc": 28.5, "checked": "0x" + "a" * 40,
+                       "positions": [{"title": "Q", "outcome": "Yes", "size": 10, "avgPrice": 0.5,
+                                      "curPrice": 0.6, "currentValue": 6.0, "cashPnl": 1.0}]}
+    assert "$28.50 USDC cash" in _wallet_card() and "$34.50 total" in _wallet_card()
+    STATE["wallet"] = {"usdc": 0.0, "checked": "0x" + "b" * 40, "positions": []}
+    assert "empty on-chain" in _wallet_card()  # wrong-wallet warning fires
     print("self-check OK")
 
 
