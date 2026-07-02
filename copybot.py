@@ -478,7 +478,7 @@ def render():
     funder_chip = f'<span class="tag dim">funder {funder}</span>' if funder else ""
 
     return f"""<!doctype html><html><head><meta charset=utf-8>
-<meta http-equiv=refresh content=3><title>copybot</title><style>
+<title>copybot</title><style>
 body{{background:#0b0f17;color:#e5e7eb;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:18px;max-width:1100px}}
 h1{{font-size:15px;margin:0 0 12px}} .dim{{color:#6b7280}} .r{{text-align:right}}
 .bar{{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px}}
@@ -535,6 +535,17 @@ details.cfg summary{{cursor:pointer;font-weight:700}}
 <div class=card><table><tr><th>when</th><th>kind</th><th>side</th><th>market — outcome</th><th class=r>size</th><th>note</th></tr>{_history_rows()}</table></div>
 <h2>Bot activity log</h2>
 <div class=card><table><tr><th>time</th><th>kind</th><th>side</th><th>market — outcome</th><th class=r>size</th><th>note</th></tr>{lrows}</table></div>
+<script>
+// auto-refresh, but never while you're editing settings (unsaved text survives)
+setInterval(function() {{
+  var a = document.activeElement;
+  if (a && (a.tagName === 'INPUT' || a.tagName === 'SELECT')) return;
+  var dirty = Array.prototype.some.call(
+    document.querySelectorAll('.settings input'),
+    function(i) {{ return i.value !== i.defaultValue; }});
+  if (!dirty) location.reload();
+}}, 3000);
+</script>
 </body></html>"""
 
 
