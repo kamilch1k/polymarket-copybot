@@ -46,6 +46,7 @@ MIN_NOTIONAL = 1.0            # Polymarket rejects orders under ~$1
 SLIPPAGE = 0.02              # accept up to this much worse than his fill
 MIN_HIS_NOTIONAL = 0.0        # copy his BUY only if he put >= this many $ in (0 = no floor)
 SPEND_CAP = 15.0             # hard stop: total live BUY $ the bot may ever spend (sells always allowed)
+MAX_DAYS_OUT = 0.0           # only copy BUYs on markets ending within N days (0 = any horizon)
 MODE = "auto"                 # "auto" = copy instantly · "approve" = queue for your click
 POLL_SECONDS = 15             # REST polling is the fallback; WebSocket is the fast path
 LEADERS_EVERY = 20            # refresh leaderboard every N polls (~5 min)
@@ -207,6 +208,7 @@ def load_config():
     MIN_HIS_NOTIONAL = c.get("min_his", MIN_HIS_NOTIONAL)
     SIGNATURE_TYPE = c.get("sig_type", SIGNATURE_TYPE)
     globals()["SPEND_CAP"] = c.get("spend_cap", SPEND_CAP)
+    globals()["MAX_DAYS_OUT"] = c.get("max_days_out", MAX_DAYS_OUT)
     STATE["funder"] = c.get("funder", "")
 
 
@@ -215,7 +217,8 @@ def save_config():
         "targets": TARGETS, "funder": STATE.get("funder", ""), "fraction": COPY_FRACTION,
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
         "mode": MODE, "min_his": MIN_HIS_NOTIONAL, "sig_type": SIGNATURE_TYPE,
-        "spend_cap": SPEND_CAP, "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
+        "spend_cap": SPEND_CAP, "max_days_out": MAX_DAYS_OUT,
+        "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
 
 def load_state():
@@ -488,6 +491,26 @@ def submit(it):
         execute(it)
 
 
+ENDS_CACHE = {}
+
+
+def market_end_ts(tid):
+    """Epoch when this token's market ends (gamma lookup, cached). None = unknown."""
+    if tid in ENDS_CACHE:
+        return ENDS_CACHE[tid]
+    ts = None
+    try:
+        r = requests.get(f"{GAMMA_API}/markets", params={"clob_token_ids": tid}, timeout=10)
+        e = ((r.json() or [{}])[0].get("endDate") or "").replace("Z", "+00:00")
+        if e:
+            from datetime import datetime
+            ts = datetime.fromisoformat(e).timestamp()
+    except Exception:
+        pass  # unknown horizon copies through: missing data must not silence the bot
+    ENDS_CACHE[tid] = ts
+    return ts
+
+
 def handle(trade):
     tid = trade["asset"]
     side = trade["side"].upper()
@@ -501,6 +524,12 @@ def handle(trade):
             logline(kind="skip", side="BUY", name=name,
                     note=f"his ${his * price:,.0f} < ${MIN_HIS_NOTIONAL:,.0f} conviction floor")
             return
+        if MAX_DAYS_OUT > 0:
+            ets = market_end_ts(tid)
+            if ets and (ets - time.time()) > MAX_DAYS_OUT * 86400:
+                logline(kind="skip", side="BUY", name=name,
+                        note=f"resolves in {(ets - time.time()) / 86400:.0f}d — beyond your {MAX_DAYS_OUT:g}d horizon")
+                return
         shares = my_buy_size(his, price)
         if shares <= 0:
             logline(kind="skip", side="BUY", name=name, note="unpriced trade")
@@ -1151,6 +1180,7 @@ def _settings_form():
   <label>Max $ / trade<input name=cap value="{MAX_USDC_PER_TRADE}"></label>
   <label>Copy his BUY only if ≥ $<input name=min_his value="{MIN_HIS_NOTIONAL}"></label>
   <label>Hard stop: total live buys ≤ $<input name=spend_cap value="{SPEND_CAP}"></label>
+  <label>Only copy markets ending within <input name=max_days_out value="{MAX_DAYS_OUT:g}"> days (0 = any horizon; sells always follow)</label>
   <label>Slippage<input name=slippage value="{SLIPPAGE}"></label>
   <label>Bankroll $<input name=bankroll value="{BANKROLL}"></label>
   <button class=save type=submit>Save</button>
@@ -1463,6 +1493,7 @@ class Handler(BaseHTTPRequestHandler):
             MAX_USDC_PER_TRADE = num("cap", MAX_USDC_PER_TRADE)
             MIN_HIS_NOTIONAL = num("min_his", MIN_HIS_NOTIONAL)
             globals()["SPEND_CAP"] = num("spend_cap", SPEND_CAP)
+            globals()["MAX_DAYS_OUT"] = num("max_days_out", MAX_DAYS_OUT)
             SLIPPAGE = num("slippage", SLIPPAGE)
             BANKROLL = num("bankroll", BANKROLL)
             save_config()
@@ -1524,6 +1555,15 @@ def _check():
     assert STATE["holdings"]["t5"] > 0 and STATE["history"][-1]["drift"] == -2.0
     assert STATE["history"][-1]["price"] == limit_price(0.48, "BUY")  # priced off mid, not his fill
     globals()["midpoint"] = lambda tid: None
+    # horizon filter: months-out market skipped, soon-ending market copied
+    globals()["MAX_DAYS_OUT"] = 2.0
+    globals()["market_end_ts"] = lambda tid: time.time() + 30 * 86400
+    handle({"asset": "t6", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q6", "outcome": "Yes"})
+    assert "horizon" in STATE["log"][0]["note"] and STATE["holdings"].get("t6") is None
+    globals()["market_end_ts"] = lambda tid: time.time() + 3600
+    handle({"asset": "t7", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q7", "outcome": "Yes"})
+    assert STATE["holdings"].get("t7") == 10.0
+    globals()["MAX_DAYS_OUT"] = 0.0
     assert any("1 buys" in x for x in copy_stats([{"side": "BUY", "size": 100, "price": 0.5}]))
     a1, a2 = "0x" + "1" * 40, "0x" + "2" * 40
     assert parse_targets(f"{a1}, {a2} garbage 0xshort") == [a1, a2]
