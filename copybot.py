@@ -79,7 +79,8 @@ STATE = {
     "wallet": {},                # on-chain truth: usdc cash + open positions
     "chat": deque(maxlen=30),    # conversation with the in-bot Claude copilot
     "thinking": False,           # a Claude request is in flight
-    "spent_live": 0.0,           # cumulative $ of LIVE buys, enforced against SPEND_CAP
+    "spent_live": 0.0,           # net live $ in play, enforced against SPEND_CAP
+    "live_cost": {},             # token -> live $ spent on it (resolve/sell frees budget)
     "missing_deps": [],          # runtime modules that failed to import at startup
 }
 
@@ -230,13 +231,14 @@ def load_state():
     STATE["names"] = s.get("names", {})
     STATE["history"] = s.get("history", [])
     STATE["spent_live"] = s.get("spent_live", 0.0)
+    STATE["live_cost"] = s.get("live_cost", {})
 
 
 def save_state():
     with LOCK:
         data = {"seen": sorted(STATE["seen"]), "holdings": STATE["holdings"],
                 "names": STATE["names"], "history": STATE["history"][-500:],
-                "spent_live": STATE["spent_live"]}
+                "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"]}
     STATE_FILE.write_text(json.dumps(data))
 
 
@@ -313,6 +315,32 @@ def onchain_usdc(addr):
     if pusd is None and usdce is None:
         return None
     return (pusd or 0.0) + (usdce or 0.0)
+
+
+def settle_resolved():
+    """When a copied position's market resolves, free its budget: a win returns
+    shares×$1 to the wallet, so it is no longer 'in play'. Losses stay counted
+    (still money in the hole). DRY copies just get cleared, never credited."""
+    with LOCK:
+        held = {t: s for t, s in STATE["holdings"].items() if s > 0}
+        posmap = {p.get("asset"): p for p in STATE["wallet"].get("positions", [])}
+    for tid, sh in held.items():
+        p = posmap.get(tid)
+        if not p or not p.get("redeemable"):
+            continue
+        won = float(p.get("curPrice") or 0) > 0.5
+        name = STATE["names"].get(tid, tid[:16])
+        with LOCK:
+            was_live = STATE["live_cost"].pop(tid, None) is not None
+            STATE["holdings"].pop(tid, None)
+            back = round(sh * 1.0, 2) if (won and was_live) else 0.0
+            if back:
+                STATE["spent_live"] = round(max(0.0, STATE["spent_live"] - back), 2)
+        note = (f"resolved WON — ${back:,.2f} freed back into budget" if won and was_live else
+                "resolved WON (dry copy — nothing was spent)" if won else
+                "resolved LOST — stays counted against budget")
+        logline(hist=True, kind="live" if won else "skip", side="RESOLVE", name=name, shares=sh, note=note)
+        save_state()
 
 
 def fetch_wallet():
@@ -412,7 +440,7 @@ def over_budget(notional):
         return STATE["spent_live"] + notional > SPEND_CAP + 1e-9
 
 
-def _order(tid, side, shares, ref, name, drift=None):
+def _order(tid, side, shares, ref, name, drift=None, who=""):
     price = limit_price(ref, side, tick_of(tid))
     with LOCK:
         live = STATE["live"]
@@ -448,11 +476,15 @@ def _order(tid, side, shares, ref, name, drift=None):
             with LOCK:  # cap tracks net $ in play: buys add, sell proceeds refund
                 delta = price * shares if side == "BUY" else -price * shares
                 STATE["spent_live"] = round(max(0.0, STATE["spent_live"] + delta), 2)
+                if side == "BUY":  # remember which holdings cost live money (for resolve credit)
+                    STATE["live_cost"][tid] = round(STATE["live_cost"].get(tid, 0.0) + price * shares, 2)
+                else:
+                    STATE["live_cost"].pop(tid, None)  # we always exit the whole position
         except Exception as ex:
             kind, note = "error", str(ex)[:140]
     e = {"d": time.strftime("%Y-%m-%d"), "t": time.strftime("%H:%M:%S"), "kind": kind,
          "side": side, "name": name, "shares": shares, "price": price, "note": note,
-         "drift": drift}
+         "drift": drift, "who": who}
     with LOCK:
         STATE["log"].appendleft(e)
         STATE["history"].append(e)
@@ -470,7 +502,7 @@ def execute(it):
         if shares <= 0:
             logline(kind="skip", side="SELL", name=it["name"], note="nothing left to sell")
             return
-    if _order(tid, side, shares, it["ref"], it["name"], it.get("drift")):
+    if _order(tid, side, shares, it["ref"], it["name"], it.get("drift"), it.get("who", "")):
         with LOCK:
             delta = shares if side == "BUY" else -shares
             STATE["holdings"][tid] = round(STATE["holdings"].get(tid, 0.0) + delta, 2)
@@ -485,7 +517,7 @@ def submit(it):
             it["id"] = str(STATE["pid"])
             it["t"] = time.strftime("%H:%M:%S")
             STATE["pending"][it["id"]] = it
-        logline(kind="pend", side=it["side"], name=it["name"], shares=it["shares"],
+        logline(kind="pend", side=it["side"], name=it["name"], shares=it["shares"], who=it.get("who", ""),
                 price=limit_price(it["ref"], it["side"]), note="awaiting approval")
     else:
         execute(it)
@@ -517,32 +549,41 @@ def handle(trade):
     price = float(trade["price"])
     his = float(trade["size"])
     name = f"{trade.get('title', '?')} — {trade.get('outcome', '?')}"
+    pw = str(trade.get("proxyWallet", "")).lower()
+    who = trade.get("_who") or STATE["tnames"].get(pw) or (pw[:8] + "…" if pw else "")
     with LOCK:
         STATE["names"][tid] = name
     if side == "BUY":
         if his * price < MIN_HIS_NOTIONAL:
-            logline(kind="skip", side="BUY", name=name,
+            logline(kind="skip", side="BUY", name=name, who=who,
                     note=f"his ${his * price:,.0f} < ${MIN_HIS_NOTIONAL:,.0f} conviction floor")
+            return
+        with LOCK:  # his 82-fill burst is ONE order: copy it once, don't stack 82 times
+            dup = STATE["holdings"].get(tid, 0) > 0 or any(
+                p.get("tid") == tid and p.get("side") == "BUY" for p in STATE["pending"].values())
+        if dup:
+            logline(kind="skip", side="BUY", name=name, who=who,
+                    note="already holding/queued this market — not stacking copies")
             return
         if MAX_DAYS_OUT > 0:
             ets = market_end_ts(tid)
             if ets and (ets - time.time()) > MAX_DAYS_OUT * 86400:
-                logline(kind="skip", side="BUY", name=name,
+                logline(kind="skip", side="BUY", name=name, who=who,
                         note=f"resolves in {(ets - time.time()) / 86400:.0f}d — beyond your {MAX_DAYS_OUT:g}d horizon")
                 return
         shares = my_buy_size(his, price)
         if shares <= 0:
-            logline(kind="skip", side="BUY", name=name, note="unpriced trade")
+            logline(kind="skip", side="BUY", name=name, who=who, note="unpriced trade")
             return
     else:
         with LOCK:
             held = STATE["holdings"].get(tid, 0.0)
         shares = held  # he's exiting — exit our whole copy (we size by $, not by his %)
         if shares <= 0:
-            logline(kind="skip", side="SELL", name=name, note="nothing copied")
+            logline(kind="skip", side="SELL", name=name, who=who, note="nothing copied")
             return
         if shares * price < MIN_NOTIONAL:
-            logline(kind="skip", side="SELL", name=name,
+            logline(kind="skip", side="SELL", name=name, who=who,
                     note="position under the $1 sell minimum — rides to resolution")
             return
 
@@ -552,13 +593,14 @@ def handle(trade):
     if mid:
         drift = round(((mid - price) if side == "BUY" else (price - mid)) * 100, 2)
         if side == "BUY" and mid > price * (1 + SLIPPAGE):
-            logline(kind="skip", side="BUY", name=name,
+            logline(kind="skip", side="BUY", name=name, who=who,
                     note=f"won't chase: mid {mid:.3f} already ran past his {price:.3f}+slippage")
             return
         ref = min(price, mid) if side == "BUY" else mid  # never pay above market / always exit at market
     else:
         ref = price
-    submit({"tid": tid, "side": side, "shares": shares, "ref": ref, "name": name, "drift": drift})
+    submit({"tid": tid, "side": side, "shares": shares, "ref": ref, "name": name,
+            "drift": drift, "who": who})
 
 
 def sell_position(tid):
@@ -897,6 +939,7 @@ def bot_loop():
                 with LOCK:
                     STATE["leaders"] = leaders
         fetch_wallet()
+        settle_resolved()
         polls += 1
 
         if not TARGETS:
@@ -955,6 +998,12 @@ KIND_COLOR = {"live": "#4ade80", "dry": "#93c5fd", "skip": "#9ca3af",
               "error": "#f87171", "pend": "#fbbf24"}
 
 
+def _nw(e):
+    """Market name plus a dim 'which trader' suffix when attribution is known."""
+    w = e.get("who") if isinstance(e, dict) else ""
+    return f'{e.get("name", "")}' + (f' <span class=dim>· {w}</span>' if w else "")
+
+
 def _pending_card():
     with LOCK:
         pending = list(STATE["pending"].values())
@@ -965,7 +1014,7 @@ def _pending_card():
         px = limit_price(it["ref"], it["side"])
         col = "#4ade80" if it["side"] == "BUY" else "#fca5a5"
         rows += (f'<tr><td class=dim>{it["t"]}</td><td style=color:{col}>{it["side"]}</td>'
-                 f'<td>{it["name"]}</td><td class=r>{it["shares"]:g} @ {px}</td><td>'
+                 f'<td>{_nw(it)}</td><td class=r>{it["shares"]:g} @ {px}</td><td>'
                  f'<form method=post action=/approve style=display:inline>'
                  f'<input type=hidden name=id value="{it["id"]}"><button class=go>✓ approve</button></form> '
                  f'<form method=post action=/reject style=display:inline>'
@@ -985,7 +1034,7 @@ def _history_rows():
         c = KIND_COLOR.get(e.get("kind"), "#e5e7eb")
         out += (f'<tr><td class=dim>{e.get("d", "")} {e.get("t", "")}</td>'
                 f'<td style=color:{c}>{e.get("kind", "").upper()}</td><td>{e.get("side", "")}</td>'
-                f'<td>{e.get("name", "")}</td><td class=r>{e.get("shares", "")} @ {e.get("price", "")}</td>'
+                f'<td>{_nw(e)}</td><td class=r>{e.get("shares", "")} @ {e.get("price", "")}</td>'
                 f'<td class=dim>{e.get("note", "")}</td></tr>')
     return out or "<tr><td colspan=6 class=dim>no trades yet</td></tr>"
 
@@ -1227,7 +1276,7 @@ def render_dyn():
         c = KIND_COLOR.get(e.get("kind"), "#e5e7eb")
         px = f'@{e["price"]}' if "price" in e else ""
         lrows += (f'<tr><td class=dim>{e["t"]}</td><td style=color:{c}>{e.get("kind", "").upper()}</td>'
-                  f'<td>{e.get("side", "")}</td><td>{e.get("name", "")}</td>'
+                  f'<td>{e.get("side", "")}</td><td>{_nw(e)}</td>'
                   f'<td class=r>{e.get("shares", "")} {px}</td><td class=dim>{e.get("note", "")}</td></tr>')
     lrows = lrows or "<tr><td colspan=6 class=dim>waiting…</td></tr>"
     stats = "".join(f"<li>{s}</li>" for s in copy_stats(feed))
@@ -1564,9 +1613,27 @@ def _check():
     handle({"asset": "t6", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q6", "outcome": "Yes"})
     assert "horizon" in STATE["log"][0]["note"] and STATE["holdings"].get("t6") is None
     globals()["market_end_ts"] = lambda tid: time.time() + 3600
-    handle({"asset": "t7", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q7", "outcome": "Yes"})
+    handle({"asset": "t7", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q7",
+            "outcome": "Yes", "_who": "guyX"})
     assert STATE["holdings"].get("t7") == 10.0
+    assert STATE["history"][-1].get("who") == "guyX"   # copies say which trader triggered them
+    assert "guyX" in render_dyn()
+    # burst fills don't stack: second buy on an already-held market is skipped
+    handle({"asset": "t7", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q7", "outcome": "Yes"})
+    assert "not stacking" in STATE["log"][0]["note"] and STATE["holdings"]["t7"] == 10.0
     globals()["MAX_DAYS_OUT"] = 0.0
+    # resolution frees budget: live win credits, dry win doesn't, loss stays counted
+    STATE["holdings"].update({"w1": 2.0, "w2": 3.0, "w3": 4.0})
+    STATE["live_cost"] = {"w1": 1.0, "w3": 1.2}
+    STATE["spent_live"] = 10.0
+    STATE["wallet"] = {"positions": [
+        {"asset": "w1", "redeemable": True, "curPrice": 1},    # live copy, WON  -> +$2 freed
+        {"asset": "w2", "redeemable": True, "curPrice": 1},    # dry copy, WON   -> no credit
+        {"asset": "w3", "redeemable": True, "curPrice": 0}]}   # live copy, LOST -> no credit
+    settle_resolved()
+    assert STATE["spent_live"] == 8.0 and not STATE["live_cost"]
+    assert all(t not in STATE["holdings"] for t in ("w1", "w2", "w3"))
+    STATE["wallet"] = {}
     assert any("1 buys" in x for x in copy_stats([{"side": "BUY", "size": 100, "price": 0.5}]))
     a1, a2 = "0x" + "1" * 40, "0x" + "2" * 40
     assert parse_targets(f"{a1}, {a2} garbage 0xshort") == [a1, a2]
