@@ -524,6 +524,7 @@ def submit(it):
 
 
 ENDS_CACHE = {}
+INFLIGHT_BUYS = set()  # tokens whose first copy is mid-placement (race guard, in-memory)
 
 
 def market_end_ts(tid):
@@ -554,53 +555,62 @@ def handle(trade):
     with LOCK:
         STATE["names"][tid] = name
     if side == "BUY":
-        if his * price < MIN_HIS_NOTIONAL:
-            logline(kind="skip", side="BUY", name=name, who=who,
-                    note=f"his ${his * price:,.0f} < ${MIN_HIS_NOTIONAL:,.0f} conviction floor")
-            return
-        with LOCK:  # his 82-fill burst is ONE order: copy it once, don't stack 82 times
-            dup = STATE["holdings"].get(tid, 0) > 0 or any(
-                p.get("tid") == tid and p.get("side") == "BUY" for p in STATE["pending"].values())
+        # one copy per market: his 82-fill burst is ONE order. INFLIGHT closes the
+        # ws-thread/poll-thread race while the first copy's order is still placing.
+        with LOCK:
+            dup = (STATE["holdings"].get(tid, 0) > 0 or tid in INFLIGHT_BUYS or any(
+                p.get("tid") == tid and p.get("side") == "BUY" for p in STATE["pending"].values()))
+            if not dup:
+                INFLIGHT_BUYS.add(tid)
         if dup:
             logline(kind="skip", side="BUY", name=name, who=who,
                     note="already holding/queued this market — not stacking copies")
             return
-        if MAX_DAYS_OUT > 0:
-            ets = market_end_ts(tid)
-            if ets and (ets - time.time()) > MAX_DAYS_OUT * 86400:
+    try:
+        if side == "BUY":
+            if his * price < MIN_HIS_NOTIONAL:
                 logline(kind="skip", side="BUY", name=name, who=who,
-                        note=f"resolves in {(ets - time.time()) / 86400:.0f}d — beyond your {MAX_DAYS_OUT:g}d horizon")
+                        note=f"his ${his * price:,.0f} < ${MIN_HIS_NOTIONAL:,.0f} conviction floor")
                 return
-        shares = my_buy_size(his, price)
-        if shares <= 0:
-            logline(kind="skip", side="BUY", name=name, who=who, note="unpriced trade")
-            return
-    else:
-        with LOCK:
-            held = STATE["holdings"].get(tid, 0.0)
-        shares = held  # he's exiting — exit our whole copy (we size by $, not by his %)
-        if shares <= 0:
-            logline(kind="skip", side="SELL", name=name, who=who, note="nothing copied")
-            return
-        if shares * price < MIN_NOTIONAL:
-            logline(kind="skip", side="SELL", name=name, who=who,
-                    note="position under the $1 sell minimum — rides to resolution")
-            return
+            if MAX_DAYS_OUT > 0:
+                ets = market_end_ts(tid)
+                if ets and (ets - time.time()) > MAX_DAYS_OUT * 86400:
+                    logline(kind="skip", side="BUY", name=name, who=who,
+                            note=f"resolves in {(ets - time.time()) / 86400:.0f}d — beyond your {MAX_DAYS_OUT:g}d horizon")
+                    return
+            shares = my_buy_size(his, price)
+            if shares <= 0:
+                logline(kind="skip", side="BUY", name=name, who=who, note="unpriced trade")
+                return
+        else:
+            with LOCK:
+                held = STATE["holdings"].get(tid, 0.0)
+            shares = held  # he's exiting — exit our whole copy (we size by $, not by his %)
+            if shares <= 0:
+                logline(kind="skip", side="SELL", name=name, who=who, note="nothing copied")
+                return
+            if shares * price < MIN_NOTIONAL:
+                logline(kind="skip", side="SELL", name=name, who=who,
+                        note="position under the $1 sell minimum — rides to resolution")
+                return
 
-    # pre-flight: check where the market is NOW, not where it was when he traded
-    mid = midpoint(tid)
-    drift = None
-    if mid:
-        drift = round(((mid - price) if side == "BUY" else (price - mid)) * 100, 2)
-        if side == "BUY" and mid > price * (1 + SLIPPAGE):
-            logline(kind="skip", side="BUY", name=name, who=who,
-                    note=f"won't chase: mid {mid:.3f} already ran past his {price:.3f}+slippage")
-            return
-        ref = min(price, mid) if side == "BUY" else mid  # never pay above market / always exit at market
-    else:
-        ref = price
-    submit({"tid": tid, "side": side, "shares": shares, "ref": ref, "name": name,
-            "drift": drift, "who": who})
+        # pre-flight: check where the market is NOW, not where it was when he traded
+        mid = midpoint(tid)
+        drift = None
+        if mid:
+            drift = round(((mid - price) if side == "BUY" else (price - mid)) * 100, 2)
+            if side == "BUY" and mid > price * (1 + SLIPPAGE):
+                logline(kind="skip", side="BUY", name=name, who=who,
+                        note=f"won't chase: mid {mid:.3f} already ran past his {price:.3f}+slippage")
+                return
+            ref = min(price, mid) if side == "BUY" else mid  # never pay above market / always exit at market
+        else:
+            ref = price
+        submit({"tid": tid, "side": side, "shares": shares, "ref": ref, "name": name,
+                "drift": drift, "who": who})
+    finally:
+        if side == "BUY":  # holdings/pending now reflect the copy; marker no longer needed
+            INFLIGHT_BUYS.discard(tid)
 
 
 def sell_position(tid):
@@ -1621,6 +1631,12 @@ def _check():
     # burst fills don't stack: second buy on an already-held market is skipped
     handle({"asset": "t7", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q7", "outcome": "Yes"})
     assert "not stacking" in STATE["log"][0]["note"] and STATE["holdings"]["t7"] == 10.0
+    assert "t7" not in INFLIGHT_BUYS  # marker released after the copy landed
+    # race guard: a concurrent in-flight copy of the same market blocks the second thread
+    INFLIGHT_BUYS.add("t8")
+    handle({"asset": "t8", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q8", "outcome": "Yes"})
+    assert "not stacking" in STATE["log"][0]["note"] and STATE["holdings"].get("t8") is None
+    INFLIGHT_BUYS.discard("t8")
     globals()["MAX_DAYS_OUT"] = 0.0
     # resolution frees budget: live win credits, dry win doesn't, loss stays counted
     STATE["holdings"].update({"w1": 2.0, "w2": 3.0, "w3": 4.0})
