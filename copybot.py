@@ -412,7 +412,8 @@ def _order(tid, side, shares, ref, name, drift=None):
         return False
     kind, note = "dry", ""
     if live:
-        from py_clob_client_v2.clob_types import OrderArgs, MarketOrderArgs, OrderType
+        from py_clob_client_v2.clob_types import (OrderArgs, MarketOrderArgs, OrderType,
+                                                  BalanceAllowanceParams, AssetType)
         try:
             cl = get_client()
             if side == "BUY":
@@ -422,6 +423,13 @@ def _order(tid, side, shares, ref, name, drift=None):
                 signed = cl.create_market_order(MarketOrderArgs(
                     token_id=tid, amount=amt, side="BUY", price=price, order_type=OrderType.FAK))
             else:
+                # selling an outcome token needs the CLOB's cached token balance synced
+                # with the chain first, else it reads 0 and rejects ("not enough balance")
+                try:
+                    cl.update_balance_allowance(BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL, token_id=tid, signature_type=SIGNATURE_TYPE))
+                except Exception:
+                    pass
                 # FAK marketable limit: fill now or die, never rest at a stale price
                 signed = cl.create_order(OrderArgs(token_id=tid, price=price, size=shares, side="SELL"))
             note = str(cl.post_order(signed, OrderType.FAK))[:80]
@@ -541,18 +549,26 @@ def test_trade():
         cl = get_client()
         tid, ref, title = pick_test_market()
         name = f"TEST · {title}"
-        from py_clob_client_v2.clob_types import OrderArgs, MarketOrderArgs, OrderType
+        from py_clob_client_v2.clob_types import (OrderArgs, MarketOrderArgs, OrderType,
+                                                  BalanceAllowanceParams, AssetType)
         tick = tick_of(tid)
         buy_px = limit_price(ref, "BUY", tick)
         r = cl.post_order(cl.create_market_order(MarketOrderArgs(
             token_id=tid, amount=1.00, side="BUY", price=buy_px, order_type=OrderType.FAK)), OrderType.FAK)
-        shares = round(1.00 / buy_px, 2)  # approx fill, for the sell-back leg
-        logline(kind="live", side="BUY", name=name, shares=shares, price=buy_px, note=str(r)[:70])
-        time.sleep(3)  # let the buy settle before selling it back
+        logline(kind="live", side="BUY", name=name, shares=round(1.0 / buy_px, 2), price=buy_px, note=str(r)[:70])
+        time.sleep(3)  # let the buy settle
+        # sync the CLOB's view of our token balance, then sell exactly what we actually hold
+        # (also liquidates any leftover position from earlier failed test round-trips)
+        p = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid, signature_type=SIGNATURE_TYPE)
+        cl.update_balance_allowance(p)
+        held = int(float(cl.get_balance_allowance(p).get("balance", 0)) / 1e4) / 100.0  # floor to cents
+        if held < 0.01:
+            logline(kind="error", note="test: buy left no sellable balance (fill may be pending)")
+            return
         sell_px = limit_price(ref, "SELL", tick)
-        r = cl.post_order(cl.create_order(OrderArgs(token_id=tid, price=sell_px, size=shares, side="SELL")),
+        r = cl.post_order(cl.create_order(OrderArgs(token_id=tid, price=sell_px, size=held, side="SELL")),
                           OrderType.FAK)
-        logline(kind="live", side="SELL", name=name, shares=shares, price=sell_px, note=str(r)[:70])
+        logline(kind="live", side="SELL", name=name, shares=held, price=sell_px, note=str(r)[:70])
         with LOCK:
             STATE["conn"] = (True, "✓ test trade round-trip sent — see activity log for both fills")
     except Exception as ex:
