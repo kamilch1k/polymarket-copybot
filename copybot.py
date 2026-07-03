@@ -532,6 +532,37 @@ def handle(trade):
     submit({"tid": tid, "side": side, "shares": shares, "ref": ref, "name": name, "drift": drift})
 
 
+def sell_position(tid):
+    """Market-sell one on-chain position (the wallet-card sell button). Sells the
+    actual held balance, so it also liquidates strays like old test-trade legs."""
+    with LOCK:
+        pos = next((p for p in STATE["wallet"].get("positions", []) if p.get("asset") == tid), {})
+    name = f'{pos.get("title", "position")} — {pos.get("outcome", "?")}'
+    if not STATE["live"]:
+        logline(kind="skip", side="SELL", name=name, note="DRY mode — flip to LIVE to sell for real")
+        return
+    try:
+        cl = get_client()
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        p = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid,
+                                   signature_type=SIGNATURE_TYPE)
+        cl.update_balance_allowance(p)  # sync CLOB's cached balance with the chain
+        held = int(float(cl.get_balance_allowance(p).get("balance", 0)) / 1e4) / 100.0
+        if held <= 0:
+            logline(kind="error", side="SELL", name=name, note="chain reports 0 balance for this token")
+            return
+        ref = midpoint(tid) or float(pos.get("curPrice") or 0)
+        if not ref:
+            logline(kind="error", side="SELL", name=name, note="no market price available")
+            return
+        if _order(tid, "SELL", held, ref, name):
+            with LOCK:
+                STATE["holdings"].pop(tid, None)
+            save_state()
+    except Exception as ex:
+        logline(kind="error", side="SELL", name=name, note=str(ex)[:140])
+
+
 def pick_test_market():
     """An active, liquid market whose token the CLOB verifiably accepts right now.
     (The target's own feed is unusable here: fast sports markets resolve within
@@ -980,15 +1011,21 @@ def _wallet_card():
         pnl = float(p.get("cashPnl") or 0)
         pct = float(p.get("percentPnl") or 0)
         col = "#4ade80" if pnl >= 0 else "#f87171"
+        sell = ""
+        if p.get("asset") and not p.get("redeemable"):
+            sell = (f'<form method=post action=/sellpos style=display:inline '
+                    f'onsubmit="return confirm(\'Sell this whole position at market now?\')">'
+                    f'<input type=hidden name=tid value="{p["asset"]}">'
+                    f'<button class=dry title="market-sell the whole position">sell</button></form>')
         rows += (f'<tr><td>{p.get("title", "?")} — {p.get("outcome", "?")}</td>'
                  f'<td class=r>{float(p.get("size") or 0):g}</td>'
                  f'<td class=r>{float(p.get("avgPrice") or 0):.3f} → {float(p.get("curPrice") or 0):.3f}</td>'
                  f'<td class=r>${float(p.get("currentValue") or 0):,.2f}</td>'
                  f'<td class=r style=color:{col}>{pnl:+,.2f} ({pct:+.1f}%)</td>'
-                 f'<td class=dim>{_fmt_ends(p)}</td></tr>')
-    rows = rows or "<tr><td colspan=6 class=dim>no open positions on-chain</td></tr>"
+                 f'<td class=dim>{_fmt_ends(p)}</td><td>{sell}</td></tr>')
+    rows = rows or "<tr><td colspan=7 class=dim>no open positions on-chain</td></tr>"
     if dust:
-        rows += (f'<tr><td colspan=6 class=dim>… {dust} settled/worthless positions hidden '
+        rows += (f'<tr><td colspan=7 class=dim>… {dust} settled/worthless positions hidden '
                  f'(old resolved bets, $0 value)</td></tr>')
     checked = w.get("checked", "")
     tradeable = w.get("tradeable")
@@ -1008,7 +1045,7 @@ def _wallet_card():
             f'<div style=margin-bottom:4px><b>{cash_s}</b> · ${total:,.2f} in positions{total_s}</div>'
             f'<div class=dim style="font-size:11px;margin-bottom:6px">checking {checked}</div>'
             f'<table><tr><th>market — outcome</th><th class=r>shares</th><th class=r>avg → now</th>'
-            f'<th class=r>value</th><th class=r>pnl</th><th>plays out</th></tr>{rows}</table>{warn}</div>')
+            f'<th class=r>value</th><th class=r>pnl</th><th>plays out</th><th></th></tr>{rows}</table>{warn}</div>')
 
 
 def _target_rows():
@@ -1167,14 +1204,24 @@ def render_dyn():
         errbar = (f'<div class=err>⚠ Missing Python modules: <b>{", ".join(md)}</b> — the app cannot trade until '
                   f'these are installed. Open a terminal and run:<br><code>pip install {" ".join(md)}</code><br>'
                   f'then close and relaunch Copybot.</div>') + errbar
-    tlabel = ", ".join(tnames.get(a, a[:8] + "…") for a in TARGETS) or "none set"
     funder = STATE.get("funder") or os.environ.get("PM_FUNDER", "")
     funder_chip = f'<span class="tag dim">funder {funder}</span>' if funder else ""
 
+    def _prof_btn(addr, label, tip):
+        return (f'<form method=post action=/openpm style=display:inline>'
+                f'<input type=hidden name=addr value="{addr}">'
+                f'<button class=copy title="{tip}">{label} ↗</button></form>')
+
+    tgt_btns = " ".join(_prof_btn(a, tnames.get(a, a[:8] + "…"),
+                                  "open their Polymarket profile in your browser") for a in TARGETS) \
+        or '<span class="tag dim">no target set</span>'
+    me_btn = _prof_btn(funder, "my profile", "open your Polymarket profile in your browser") if funder else ""
+
     return f"""<div class=bar>
   <span class=pill>{pill}</span>
-  <span class="tag dim">target {tlabel}</span>
+  <span class="tag dim">copying</span> {tgt_btns}
   {funder_chip}
+  {me_btn}
   <span class="tag dim">copies {copies}</span>
   <span class="tag" style="color:#fbbf24">budget ${STATE["spent_live"]:.2f} / ${SPEND_CAP:.2f}</span>
   <span class="tag dim">up {up // 3600}h{up % 3600 // 60}m</span>
@@ -1354,6 +1401,15 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["conn"] = (False, str(ex)[:160])
         elif path == "/testtrade":
             threading.Thread(target=test_trade, daemon=True).start()
+        elif path == "/sellpos":  # wallet-card sell button: liquidate one position
+            tid = f.get("tid", [""])[0].strip()
+            if tid:
+                threading.Thread(target=sell_position, args=(tid,), daemon=True).start()
+        elif path == "/openpm":  # open a Polymarket profile in the system browser
+            addr = f.get("addr", [""])[0].strip()
+            if valid_addr(addr):
+                import webbrowser
+                webbrowser.open(f"https://polymarket.com/profile/{addr}")
         elif path == "/ask":
             q = f.get("q", [""])[0].strip()
             if q and not STATE["thinking"]:
@@ -1487,6 +1543,15 @@ def _check():
     STATE["spent_live"], globals()["SPEND_CAP"] = 19.50, 20.0
     assert not over_budget(0.49) and over_budget(0.51)
     STATE["spent_live"] = 0.0
+    # wallet sell button: renders per live position, DRY mode refuses politely
+    STATE["wallet"] = {"positions": [{"asset": "tok9", "title": "T9", "outcome": "Yes",
+                                      "size": 10, "avgPrice": 0.5, "curPrice": 0.5,
+                                      "currentValue": 5.0, "cashPnl": 0, "percentPnl": 0}]}
+    assert "/sellpos" in _wallet_card() and 'value="tok9"' in _wallet_card()
+    STATE["live"] = False
+    sell_position("tok9")
+    assert "DRY mode" in STATE["log"][0]["note"]
+    STATE["wallet"] = {}
     page = render()
     assert "copybot" in page and "Settings" in page and "leaderboard" in page and "Trade history" in page
     assert "Ask Claude" in page and "action=/ask" in page
