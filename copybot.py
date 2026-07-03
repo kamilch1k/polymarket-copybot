@@ -44,8 +44,8 @@ COPY_FRACTION = 0.01          # copy 1% of his share size
 MAX_USDC_PER_TRADE = 5.0      # per-copy notional cap
 MIN_NOTIONAL = 1.0            # Polymarket rejects orders under ~$1
 SLIPPAGE = 0.02              # accept up to this much worse than his fill
-MIN_HIS_NOTIONAL = 50.0       # copy his BUY only if he put >= this many $ in (skip his dust)
-SPEND_CAP = 20.0              # hard stop: total live BUY $ the bot may ever spend (sells always allowed)
+MIN_HIS_NOTIONAL = 0.0        # copy his BUY only if he put >= this many $ in (0 = no floor)
+SPEND_CAP = 15.0             # hard stop: total live BUY $ the bot may ever spend (sells always allowed)
 MODE = "auto"                 # "auto" = copy instantly · "approve" = queue for your click
 POLL_SECONDS = 15             # REST polling is the fallback; WebSocket is the fast path
 LEADERS_EVERY = 20            # refresh leaderboard every N polls (~5 min)
@@ -412,12 +412,18 @@ def _order(tid, side, shares, ref, name, drift=None):
         return False
     kind, note = "dry", ""
     if live:
-        from py_clob_client_v2.clob_types import OrderArgs, OrderType
+        from py_clob_client_v2.clob_types import OrderArgs, MarketOrderArgs, OrderType
         try:
             cl = get_client()
-            signed = cl.create_order(OrderArgs(token_id=tid, price=price, size=shares, side=side))
-            # FAK = fill what's there right now, cancel the rest — an order that
-            # misses must die, not rest in the book and fill later at a stale price
+            if side == "BUY":
+                # market buy sized by a whole-cent USDC amount — the exchange rejects
+                # buy maker amounts with >2 decimals (price*size gives too many)
+                amt = max(1.0, round(price * shares, 2))
+                signed = cl.create_market_order(MarketOrderArgs(
+                    token_id=tid, amount=amt, side="BUY", price=price, order_type=OrderType.FAK))
+            else:
+                # FAK marketable limit: fill now or die, never rest at a stale price
+                signed = cl.create_order(OrderArgs(token_id=tid, price=price, size=shares, side="SELL"))
             note = str(cl.post_order(signed, OrderType.FAK))[:80]
             kind = "live"
             if side == "BUY":
@@ -535,12 +541,12 @@ def test_trade():
         cl = get_client()
         tid, ref, title = pick_test_market()
         name = f"TEST · {title}"
-        from py_clob_client_v2.clob_types import OrderArgs, OrderType
+        from py_clob_client_v2.clob_types import OrderArgs, MarketOrderArgs, OrderType
         tick = tick_of(tid)
         buy_px = limit_price(ref, "BUY", tick)
-        shares = round(MIN_NOTIONAL * 1.1 / buy_px, 2)
-        r = cl.post_order(cl.create_order(OrderArgs(token_id=tid, price=buy_px, size=shares, side="BUY")),
-                          OrderType.FAK)
+        r = cl.post_order(cl.create_market_order(MarketOrderArgs(
+            token_id=tid, amount=1.00, side="BUY", price=buy_px, order_type=OrderType.FAK)), OrderType.FAK)
+        shares = round(1.00 / buy_px, 2)  # approx fill, for the sell-back leg
         logline(kind="live", side="BUY", name=name, shares=shares, price=buy_px, note=str(r)[:70])
         time.sleep(3)  # let the buy settle before selling it back
         sell_px = limit_price(ref, "SELL", tick)
@@ -1390,9 +1396,11 @@ def _check():
     execute(STATE["pending"].popitem()[1])
     assert STATE["holdings"]["t2"] == 10.0
     MODE = "auto"
-    # conviction floor: his $25 buy is dust, skipped
+    # conviction floor (pinned for the test): his $25 buy is below a $50 floor -> skipped
+    globals()["MIN_HIS_NOTIONAL"] = 50.0
     handle({"asset": "t3", "side": "BUY", "price": 0.5, "size": 50, "title": "Q3", "outcome": "Yes"})
     assert "conviction" in STATE["log"][0]["note"] and STATE["holdings"].get("t3") is None
+    globals()["MIN_HIS_NOTIONAL"] = 0.0
     # pre-flight: refuse to chase a run-away price
     globals()["midpoint"] = lambda tid: 0.60
     handle({"asset": "t4", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q4", "outcome": "Yes"})
