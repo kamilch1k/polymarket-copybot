@@ -1085,9 +1085,12 @@ def _target_rows():
         side = str(t.get("side", "")).upper()
         col = "#4ade80" if side == "BUY" else "#fca5a5"
         name = f"{t.get('title', '?')} — {t.get('outcome', '?')}"
-        out += (f'<tr><td class=dim>{t.get("_who", "")}</td><td style=color:{col}>{side}</td><td>{name}</td>'
+        ts = t.get("timestamp")
+        when = time.strftime("%m-%d %H:%M", time.localtime(float(ts))) if ts else ""
+        out += (f'<tr><td class=dim>{when}</td>'
+                f'<td class=dim>{t.get("_who", "")}</td><td style=color:{col}>{side}</td><td>{name}</td>'
                 f'<td class=r>{float(t.get("size", 0)):g}</td><td class=r>@{t.get("price", "")}</td></tr>')
-    return out or "<tr><td colspan=5 class=dim>no recent activity</td></tr>"
+    return out or "<tr><td colspan=6 class=dim>no recent activity</td></tr>"
 
 
 def _status_card():
@@ -1273,7 +1276,7 @@ def render_dyn():
   </div>
   <div class=card>
     <h2>Targets — live activity</h2>
-    <table><tr><th>trader</th><th>side</th><th>market — outcome</th><th class=r>size</th><th class=r>px</th></tr>{_target_rows()}</table>
+    <table><tr><th>when</th><th>trader</th><th>side</th><th>market — outcome</th><th class=r>size</th><th class=r>px</th></tr>{_target_rows()}</table>
     <h2>How to copy him best</h2>
     <ul class=tips>{stats}</ul>
   </div>
