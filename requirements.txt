@@ -1,0 +1,5 @@
+requests
+websocket-client
+py-clob-client-v2
+pywebview
+regex

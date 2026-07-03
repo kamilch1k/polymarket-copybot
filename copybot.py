@@ -79,7 +79,25 @@ STATE = {
     "chat": deque(maxlen=30),    # conversation with the in-bot Claude copilot
     "thinking": False,           # a Claude request is in flight
     "spent_live": 0.0,           # cumulative $ of LIVE buys, enforced against SPEND_CAP
+    "missing_deps": [],          # runtime modules that failed to import at startup
 }
+
+
+def check_deps():
+    """Surface any missing runtime module at startup as a loud banner, instead of
+    letting it fail cryptically deep inside the Test-trade / auto-live path."""
+    missing = []
+    for mod, pip_name in (("requests", "requests"), ("websocket", "websocket-client"),
+                          ("regex", "regex"), ("py_clob_client_v2", "py-clob-client-v2")):
+        try:
+            __import__(mod)
+        except Exception:
+            missing.append(pip_name)
+    STATE["missing_deps"] = missing
+    if missing:
+        logline(kind="error", note="missing modules: " + ", ".join(missing)
+                + " — run: pip install " + " ".join(missing) + " , then relaunch")
+    return missing
 
 
 # ---- pure logic (unit-tested in _check) -------------------------------------
@@ -1083,6 +1101,11 @@ def render_dyn():
     lrows = lrows or "<tr><td colspan=6 class=dim>waiting…</td></tr>"
     stats = "".join(f"<li>{s}</li>" for s in copy_stats(feed))
     errbar = f'<div class=err>{err}</div>' if err else ""
+    md = STATE.get("missing_deps") or []
+    if md:
+        errbar = (f'<div class=err>⚠ Missing Python modules: <b>{", ".join(md)}</b> — the app cannot trade until '
+                  f'these are installed. Open a terminal and run:<br><code>pip install {" ".join(md)}</code><br>'
+                  f'then close and relaunch Copybot.</div>') + errbar
     tlabel = ", ".join(tnames.get(a, a[:8] + "…") for a in TARGETS) or "none set"
     funder = STATE.get("funder") or os.environ.get("PM_FUNDER", "")
     funder_chip = f'<span class="tag dim">funder {funder}</span>' if funder else ""
@@ -1402,6 +1425,9 @@ def _check():
     page = render()
     assert "copybot" in page and "Settings" in page and "leaderboard" in page and "Trade history" in page
     assert "Ask Claude" in page and "action=/ask" in page
+    STATE["missing_deps"] = ["regex"]  # banner surfaces missing runtime deps
+    assert "Missing Python modules" in render_dyn() and "pip install regex" in render_dyn()
+    STATE["missing_deps"] = []
     # chat persistence round-trips through disk
     chat_add("you", "does the chat save?")
     STATE["chat"].clear()
@@ -1434,6 +1460,7 @@ if __name__ == "__main__":
         load_config()
         load_state()
         load_chat()
+        check_deps()
         threading.Thread(target=bot_loop, daemon=True).start()
         threading.Thread(target=ws_loop, daemon=True).start()
         threading.Thread(target=server.serve_forever, daemon=True).start()
