@@ -102,13 +102,14 @@ def check_deps():
 
 # ---- pure logic (unit-tested in _check) -------------------------------------
 def my_buy_size(his_size, price, fraction=None, cap=None):
-    """Shares to buy to mirror his_size at `price`. 0 = below exchange minimum.
+    """Shares to buy to mirror his_size at `price`, floored at the $1 exchange
+    minimum: every buy of his gets copied — same market beats same size.
     Defaults read the live globals so UI edits take effect immediately."""
+    if price <= 0:
+        return 0.0
     fraction = COPY_FRACTION if fraction is None else fraction
     cap = MAX_USDC_PER_TRADE if cap is None else cap
-    notional = min(his_size * price * fraction, cap)
-    if notional < MIN_NOTIONAL:
-        return 0.0
+    notional = min(max(his_size * price * fraction, MIN_NOTIONAL), cap)
     return round(notional / price, 2)
 
 
@@ -135,16 +136,19 @@ def copy_stats(feed):
     notionals = [float(t["size"]) * float(t["price"]) for t in trades]
     avg = sum(notionals) / len(notionals)
     buys = sum(1 for t in trades if t["side"].upper() == "BUY")
-    per_copy = min(avg * COPY_FRACTION, MAX_USDC_PER_TRADE)
+    per_copy = min(max(avg * COPY_FRACTION, MIN_NOTIONAL), MAX_USDC_PER_TRADE)
     lines = [
         f"his last {len(trades)} trades: {buys} buys / {len(trades) - buys} sells",
         f"his avg trade ≈ ${avg:,.0f}",
-        f"you copy {COPY_FRACTION * 100:.1f}% capped ${MAX_USDC_PER_TRADE:.0f} → ≈ ${per_copy:.2f}/copy",
-        f"bankroll ${BANKROLL:.0f} → room for ~{int(BANKROLL / max(per_copy, 0.01))} concurrent copies",
+        f"you copy {COPY_FRACTION * 100:.1f}% (min ${MIN_NOTIONAL:.0f}, cap ${MAX_USDC_PER_TRADE:.0f}) → ≈ ${per_copy:.2f}/copy",
+        f"budget ${SPEND_CAP:.0f} → room for ~{int(SPEND_CAP / max(per_copy, 0.01))} concurrent copies",
     ]
     if avg * COPY_FRACTION > MAX_USDC_PER_TRADE:
         lines.append("⚠ his size is big — your $ cap binds, so copies are flat, not proportional. "
                      "Raise the cap or drop the fraction to track him faithfully.")
+    elif avg * COPY_FRACTION < MIN_NOTIONAL:
+        lines.append(f"✓ his clips are small — every buy copies at the ${MIN_NOTIONAL:.0f} "
+                     "exchange minimum (flat sizing, same markets)")
     else:
         lines.append("✓ cap rarely binds — copies scale with his size. Faithful tracking.")
     with LOCK:
@@ -438,9 +442,9 @@ def _order(tid, side, shares, ref, name, drift=None):
                 signed = cl.create_order(OrderArgs(token_id=tid, price=price, size=shares, side="SELL"))
             note = str(cl.post_order(signed, OrderType.FAK))[:80]
             kind = "live"
-            if side == "BUY":
-                with LOCK:
-                    STATE["spent_live"] = round(STATE["spent_live"] + price * shares, 2)
+            with LOCK:  # cap tracks net $ in play: buys add, sell proceeds refund
+                delta = price * shares if side == "BUY" else -price * shares
+                STATE["spent_live"] = round(max(0.0, STATE["spent_live"] + delta), 2)
         except Exception as ex:
             kind, note = "error", str(ex)[:140]
     e = {"d": time.strftime("%Y-%m-%d"), "t": time.strftime("%H:%M:%S"), "kind": kind,
@@ -499,14 +503,18 @@ def handle(trade):
             return
         shares = my_buy_size(his, price)
         if shares <= 0:
-            logline(kind="skip", side="BUY", name=name, note=f"< ${MIN_NOTIONAL} min")
+            logline(kind="skip", side="BUY", name=name, note="unpriced trade")
             return
     else:
         with LOCK:
             held = STATE["holdings"].get(tid, 0.0)
-        shares = min(held, round(his * COPY_FRACTION, 2))
-        if shares <= 0 or shares * price < MIN_NOTIONAL:
-            logline(kind="skip", side="SELL", name=name, note="nothing copied / dust")
+        shares = held  # he's exiting — exit our whole copy (we size by $, not by his %)
+        if shares <= 0:
+            logline(kind="skip", side="SELL", name=name, note="nothing copied")
+            return
+        if shares * price < MIN_NOTIONAL:
+            logline(kind="skip", side="SELL", name=name,
+                    note="position under the $1 sell minimum — rides to resolution")
             return
 
     # pre-flight: check where the market is NOW, not where it was when he traded
@@ -1422,7 +1430,9 @@ def _check():
     globals()["tick_of"] = lambda tid: 0.01
     assert my_buy_size(1000, 0.50, 0.01, 50) == 10.0
     assert my_buy_size(1000, 0.50, 0.01, 3) == 6.0
-    assert my_buy_size(10, 0.50, 0.01, 50) == 0.0
+    assert my_buy_size(10, 0.50, 0.01, 50) == 2.0     # tiny clip floors to $1 min
+    assert my_buy_size(272, 0.2925, 0.01, 5) == 3.42  # his real median-size clip → $1 copy
+    assert my_buy_size(100, 0.0, 0.01, 5) == 0.0      # unpriced trade never divides by zero
     assert limit_price(0.50, "BUY") == 0.51
     assert limit_price(0.50, "SELL") == 0.49
     assert limit_price(0.99, "BUY") == 0.99
