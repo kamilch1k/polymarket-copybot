@@ -465,8 +465,14 @@ def _order(tid, side, shares, ref, name, drift=None, who=""):
                 # selling an outcome token needs the CLOB's cached token balance synced
                 # with the chain first, else it reads 0 and rejects ("not enough balance")
                 try:
-                    cl.update_balance_allowance(BalanceAllowanceParams(
-                        asset_type=AssetType.CONDITIONAL, token_id=tid, signature_type=SIGNATURE_TYPE))
+                    bp = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL,
+                                                token_id=tid, signature_type=SIGNATURE_TYPE)
+                    cl.update_balance_allowance(bp)
+                    # $-sized market buys fill fractional shares (6.666665, not our rounded
+                    # 6.67) — sell what the chain actually holds, floored, or the CLOB 400s
+                    actual = int(float(cl.get_balance_allowance(bp).get("balance", 0)) / 1e4) / 100.0
+                    if 0 < actual < shares:
+                        shares = actual
                 except Exception:
                     pass
                 # FAK marketable limit: fill now or die, never rest at a stale price
@@ -1582,6 +1588,7 @@ def _check():
     assert my_buy_size(10, 0.50, 0.01, 50) == 2.0     # tiny clip floors to $1 min
     assert my_buy_size(272, 0.2925, 0.01, 5) == 3.42  # his real median-size clip → $1 copy
     assert my_buy_size(100, 0.0, 0.01, 5) == 0.0      # unpriced trade never divides by zero
+    assert int(6666665 / 1e4) / 100.0 == 6.66         # chain balance floors to sellable shares
     assert limit_price(0.50, "BUY") == 0.51
     assert limit_price(0.50, "SELL") == 0.49
     assert limit_price(0.99, "BUY") == 0.99
