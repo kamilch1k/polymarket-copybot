@@ -487,14 +487,19 @@ def _order(tid, side, shares, ref, name, drift=None, who=""):
                 else:
                     STATE["live_cost"].pop(tid, None)  # we always exit the whole position
         except Exception as ex:
-            kind, note = "error", str(ex)[:140]
+            if "no orders found" in str(ex):  # FAK into a torn-down book: benign, no $ moved
+                kind, note = "skip", "book empty — FAK found nothing to match (market closing?)"
+            else:
+                kind, note = "error", str(ex)[:140]
+            if side == "BUY":
+                FAILED_BUY_AT[tid] = time.time()  # don't hammer a market that just rejected us
     e = {"d": time.strftime("%Y-%m-%d"), "t": time.strftime("%H:%M:%S"), "kind": kind,
          "side": side, "name": name, "shares": shares, "price": price, "note": note,
          "drift": drift, "who": who}
     with LOCK:
         STATE["log"].appendleft(e)
         STATE["history"].append(e)
-    return kind != "error"
+    return kind in ("live", "dry")  # only an actually-placed order updates holdings
 
 
 def execute(it):
@@ -531,6 +536,7 @@ def submit(it):
 
 ENDS_CACHE = {}
 INFLIGHT_BUYS = set()  # tokens whose first copy is mid-placement (race guard, in-memory)
+FAILED_BUY_AT = {}     # token -> when its last buy failed (cooldown against retry-hammering)
 
 
 def market_end_ts(tid):
@@ -571,6 +577,10 @@ def handle(trade):
         if dup:
             logline(kind="skip", side="BUY", name=name, who=who,
                     note="already holding/queued this market — not stacking copies")
+            return
+        if time.time() - FAILED_BUY_AT.get(tid, 0) < 90:
+            logline(kind="skip", side="BUY", name=name, who=who,
+                    note="cooling down — this market just rejected a buy")
             return
     try:
         if side == "BUY":
@@ -1644,6 +1654,11 @@ def _check():
     handle({"asset": "t8", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q8", "outcome": "Yes"})
     assert "not stacking" in STATE["log"][0]["note"] and STATE["holdings"].get("t8") is None
     INFLIGHT_BUYS.discard("t8")
+    # a market that just rejected a buy is left alone for a bit, not hammered
+    FAILED_BUY_AT["t9"] = time.time()
+    handle({"asset": "t9", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q9", "outcome": "Yes"})
+    assert "cooling down" in STATE["log"][0]["note"] and STATE["holdings"].get("t9") is None
+    FAILED_BUY_AT.clear()
     globals()["MAX_DAYS_OUT"] = 0.0
     # resolution frees budget: live win credits, dry win doesn't, loss stays counted
     STATE["holdings"].update({"w1": 2.0, "w2": 3.0, "w3": 4.0})
