@@ -233,10 +233,12 @@ def save_state():
     STATE_FILE.write_text(json.dumps(data))
 
 
-def logline(**e):
+def logline(hist=False, **e):
     e["t"] = time.strftime("%H:%M:%S")
     with LOCK:
         STATE["log"].appendleft(e)
+        if hist:  # also record in the persistent trade history (survives restarts)
+            STATE["history"].append({**e, "d": time.strftime("%Y-%m-%d")})
 
 
 # ---- polymarket api ---------------------------------------------------------
@@ -318,7 +320,9 @@ def fetch_wallet():
         pos = requests.get(f"{DATA_API}/positions", params={"user": funder, "limit": 50},
                            timeout=15).json()
         if isinstance(pos, list):
-            w["positions"] = [p for p in pos if float(p.get("size") or 0) > 0][:30]
+            live = sorted((p for p in pos if float(p.get("size") or 0) > 0),
+                          key=lambda p: -float(p.get("currentValue") or 0))
+            w["positions"] = live[:40]
     except Exception:
         pass
     try:  # CLOB "tradeable" balance, if connected — may differ from on-chain (open orders)
@@ -555,7 +559,7 @@ def test_trade():
         buy_px = limit_price(ref, "BUY", tick)
         r = cl.post_order(cl.create_market_order(MarketOrderArgs(
             token_id=tid, amount=1.00, side="BUY", price=buy_px, order_type=OrderType.FAK)), OrderType.FAK)
-        logline(kind="live", side="BUY", name=name, shares=round(1.0 / buy_px, 2), price=buy_px, note=str(r)[:70])
+        logline(hist=True, kind="live", side="BUY", name=name, shares=round(1.0 / buy_px, 2), price=buy_px, note=str(r)[:70])
         time.sleep(3)  # let the buy settle
         # sync the CLOB's view of our token balance, then sell exactly what we actually hold
         # (also liquidates any leftover position from earlier failed test round-trips)
@@ -568,7 +572,8 @@ def test_trade():
         sell_px = limit_price(ref, "SELL", tick)
         r = cl.post_order(cl.create_order(OrderArgs(token_id=tid, price=sell_px, size=held, side="SELL")),
                           OrderType.FAK)
-        logline(kind="live", side="SELL", name=name, shares=held, price=sell_px, note=str(r)[:70])
+        logline(hist=True, kind="live", side="SELL", name=name, shares=held, price=sell_px, note=str(r)[:70])
+        save_state()
         with LOCK:
             STATE["conn"] = (True, "✓ test trade round-trip sent — see activity log for both fills")
     except Exception as ex:
@@ -935,22 +940,48 @@ def _chat_card():
     return f'<h2>Claude copilot</h2><div class=card>{rows}</div>'
 
 
+def _fmt_ends(p):
+    """'2026-07-20 · 17d left' | 'today!' | 'ended — resolving' | 'settled'."""
+    ed = (p.get("endDate") or "")[:10]
+    if not ed:
+        return "?"
+    try:
+        import datetime
+        days = (datetime.date.fromisoformat(ed) - datetime.date.today()).days
+    except ValueError:
+        return ed
+    if p.get("redeemable"):
+        return f"{ed} · settled"
+    if days < 0:
+        return f"{ed} · resolving"
+    if days == 0:
+        return "today!"
+    return f"{ed} · {days}d left"
+
+
 def _wallet_card():
     with LOCK:
         w = dict(STATE["wallet"])
-    pos = w.get("positions", [])
+    allpos = w.get("positions", [])
+    pos = [p for p in allpos if float(p.get("currentValue") or 0) > 0.02]   # worth showing
+    dust = len(allpos) - len(pos)                                            # settled/worthless
     cash = w.get("usdc")
     total = sum(float(p.get("currentValue") or 0) for p in pos)
     rows = ""
     for p in pos:
         pnl = float(p.get("cashPnl") or 0)
+        pct = float(p.get("percentPnl") or 0)
         col = "#4ade80" if pnl >= 0 else "#f87171"
         rows += (f'<tr><td>{p.get("title", "?")} — {p.get("outcome", "?")}</td>'
                  f'<td class=r>{float(p.get("size") or 0):g}</td>'
                  f'<td class=r>{float(p.get("avgPrice") or 0):.3f} → {float(p.get("curPrice") or 0):.3f}</td>'
                  f'<td class=r>${float(p.get("currentValue") or 0):,.2f}</td>'
-                 f'<td class=r style=color:{col}>{pnl:+,.2f}</td></tr>')
-    rows = rows or "<tr><td colspan=5 class=dim>no open positions on-chain</td></tr>"
+                 f'<td class=r style=color:{col}>{pnl:+,.2f} ({pct:+.1f}%)</td>'
+                 f'<td class=dim>{_fmt_ends(p)}</td></tr>')
+    rows = rows or "<tr><td colspan=6 class=dim>no open positions on-chain</td></tr>"
+    if dust:
+        rows += (f'<tr><td colspan=6 class=dim>… {dust} settled/worthless positions hidden '
+                 f'(old resolved bets, $0 value)</td></tr>')
     checked = w.get("checked", "")
     tradeable = w.get("tradeable")
     if cash is None:
@@ -969,7 +1000,7 @@ def _wallet_card():
             f'<div style=margin-bottom:4px><b>{cash_s}</b> · ${total:,.2f} in positions{total_s}</div>'
             f'<div class=dim style="font-size:11px;margin-bottom:6px">checking {checked}</div>'
             f'<table><tr><th>market — outcome</th><th class=r>shares</th><th class=r>avg → now</th>'
-            f'<th class=r>value</th><th class=r>pnl $</th></tr>{rows}</table>{warn}</div>')
+            f'<th class=r>value</th><th class=r>pnl</th><th>plays out</th></tr>{rows}</table>{warn}</div>')
 
 
 def _target_rows():
@@ -1461,10 +1492,18 @@ def _check():
     dyn = render_dyn()
     assert "Status" in dyn and "Test connection" in dyn and "❌" in dyn  # unconfigured -> red rows
     assert "Your wallet" in dyn and "no open positions on-chain" in dyn
+    import datetime as _dt
+    _soon = (_dt.date.today() + _dt.timedelta(days=17)).isoformat()
     STATE["wallet"] = {"usdc": 28.5, "checked": "0x" + "a" * 40,
                        "positions": [{"title": "Q", "outcome": "Yes", "size": 10, "avgPrice": 0.5,
-                                      "curPrice": 0.6, "currentValue": 6.0, "cashPnl": 1.0}]}
-    assert "$28.50 cash (pUSD)" in _wallet_card() and "$34.50 total" in _wallet_card()
+                                      "curPrice": 0.6, "currentValue": 6.0, "cashPnl": 1.0,
+                                      "percentPnl": 20.0, "endDate": _soon},
+                                     {"title": "dead", "outcome": "No", "size": 5, "currentValue": 0.0,
+                                      "cashPnl": -3.0, "redeemable": True, "endDate": "2026-06-23"}]}
+    card = _wallet_card()
+    assert "$28.50 cash (pUSD)" in card and "$34.50 total" in card
+    assert "17d left" in card and "(+20.0%)" in card          # countdown + pnl%
+    assert "1 settled/worthless positions hidden" in card      # dust collapsed
     STATE["wallet"] = {"usdc": 0.0, "checked": "0x" + "b" * 40, "positions": []}
     assert "empty on-chain" in _wallet_card()  # wrong-wallet warning fires
     print("self-check OK")
