@@ -352,22 +352,24 @@ def reconcile_ghosts():
             continue
         if now - STATE["bought_at"].get(tid, 0) < 900:
             continue  # too fresh: positions API and CLOB cache may simply lag
-        try:
-            cl = get_client()
-            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
-            bp = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid,
-                                        signature_type=SIGNATURE_TYPE)
-            cl.update_balance_allowance(bp)
-            bal = int(float(cl.get_balance_allowance(bp).get("balance", 0)) / 1e4) / 100.0
-        except Exception:
-            continue  # can't verify this cycle
-        if bal >= 0.01:
-            RECON_NEXT[tid] = now + 600  # chain holds it; the API is just behind
-            continue
         outcome = market_state(tid)
         if outcome is None:
             RECON_NEXT[tid] = now + 600
             continue
+        if outcome == "open":
+            # market still trading: only a zero on-chain balance proves a zero-fill
+            try:
+                cl = get_client()
+                from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+                bp = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid,
+                                            signature_type=SIGNATURE_TYPE)
+                cl.update_balance_allowance(bp)
+                bal = int(float(cl.get_balance_allowance(bp).get("balance", 0)) / 1e4) / 100.0
+            except Exception:
+                continue  # can't verify this cycle
+            if bal >= 0.01:
+                RECON_NEXT[tid] = now + 600  # healthy position; positions API is behind
+                continue
         name = STATE["names"].get(tid, tid[:16])
         with LOCK:
             was_live = STATE["live_cost"].pop(tid, None)
