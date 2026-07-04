@@ -537,6 +537,7 @@ def submit(it):
 ENDS_CACHE = {}
 INFLIGHT_BUYS = set()  # tokens whose first copy is mid-placement (race guard, in-memory)
 FAILED_BUY_AT = {}     # token -> when its last buy failed (cooldown against retry-hammering)
+POLL_FAILS = {}        # target -> consecutive poll failures (transient resets stay silent)
 
 
 def market_end_ts(tid):
@@ -979,9 +980,16 @@ def bot_loop():
                 with LOCK:
                     STATE["error"] = ""
                     STATE["last_poll"] = time.time()
+                POLL_FAILS.pop(target, None)
             except Exception as ex:
-                with LOCK:
-                    STATE["error"] = f"{target[:8]}…: {ex}"
+                # one TCP reset self-heals on the next 15s cycle (WS still live) —
+                # only a streak means the feed is actually unreachable
+                n = POLL_FAILS[target] = POLL_FAILS.get(target, 0) + 1
+                if n == 3:
+                    logline(kind="error", note=f"poll of {target[:8]}… failing {n}x in a row: {str(ex)[:90]}")
+                if n >= 3:
+                    with LOCK:
+                        STATE["error"] = f"{target[:8]}… unreachable ~{n * POLL_SECONDS}s: {str(ex)[:120]}"
                 continue
 
             with LOCK:
