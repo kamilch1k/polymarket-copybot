@@ -81,6 +81,7 @@ STATE = {
     "thinking": False,           # a Claude request is in flight
     "spent_live": 0.0,           # net live $ in play, enforced against SPEND_CAP
     "live_cost": {},             # token -> live $ spent on it (resolve/sell frees budget)
+    "bought_at": {},             # token -> epoch of our buy (ghost-reconcile grace period)
     "missing_deps": [],          # runtime modules that failed to import at startup
 }
 
@@ -232,13 +233,15 @@ def load_state():
     STATE["history"] = s.get("history", [])
     STATE["spent_live"] = s.get("spent_live", 0.0)
     STATE["live_cost"] = s.get("live_cost", {})
+    STATE["bought_at"] = s.get("bought_at", {})
 
 
 def save_state():
     with LOCK:
         data = {"seen": sorted(STATE["seen"]), "holdings": STATE["holdings"],
                 "names": STATE["names"], "history": STATE["history"][-500:],
-                "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"]}
+                "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"],
+                "bought_at": STATE["bought_at"]}
     STATE_FILE.write_text(json.dumps(data))
 
 
@@ -315,6 +318,71 @@ def onchain_usdc(addr):
     if pusd is None and usdce is None:
         return None
     return (pusd or 0.0) + (usdce or 0.0)
+
+
+def market_state(tid):
+    """'won'/'lost' for a closed market's token, 'open' if trading, None if unknown."""
+    try:
+        r = requests.get(f"{GAMMA_API}/markets", params={"clob_token_ids": tid}, timeout=10)
+        m = (r.json() or [{}])[0]
+        if m.get("closed") is False:
+            return "open"
+        toks = json.loads(m.get("clobTokenIds") or "[]")
+        px = [float(x) for x in json.loads(m.get("outcomePrices") or "[]")]
+        if tid in toks and len(px) == len(toks):
+            return "won" if px[toks.index(tid)] > 0.5 else "lost"
+    except Exception:
+        pass
+    return None
+
+
+RECON_NEXT = {}  # token -> don't re-check before this time (API-lag backoff)
+
+
+def reconcile_ghosts():
+    """Holdings the positions API no longer shows. Two causes: zero-fill FAKs
+    (bought nothing, refund the budget) and auto-swept resolved markets (credit
+    wins). Chain balance is the arbiter; recent buys are left alone (cache lag)."""
+    now = time.time()
+    with LOCK:
+        held = {t: s for t, s in STATE["holdings"].items() if s > 0}
+        visible = {p.get("asset") for p in STATE["wallet"].get("positions", [])}
+    for tid, sh in held.items():
+        if tid in visible or now < RECON_NEXT.get(tid, 0):
+            continue
+        if now - STATE["bought_at"].get(tid, 0) < 900:
+            continue  # too fresh: positions API and CLOB cache may simply lag
+        try:
+            cl = get_client()
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+            bp = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid,
+                                        signature_type=SIGNATURE_TYPE)
+            cl.update_balance_allowance(bp)
+            bal = int(float(cl.get_balance_allowance(bp).get("balance", 0)) / 1e4) / 100.0
+        except Exception:
+            continue  # can't verify this cycle
+        if bal >= 0.01:
+            RECON_NEXT[tid] = now + 600  # chain holds it; the API is just behind
+            continue
+        outcome = market_state(tid)
+        if outcome is None:
+            RECON_NEXT[tid] = now + 600
+            continue
+        name = STATE["names"].get(tid, tid[:16])
+        with LOCK:
+            was_live = STATE["live_cost"].pop(tid, None)
+            STATE["holdings"].pop(tid, None)
+            STATE["bought_at"].pop(tid, None)
+            if was_live is not None and outcome == "won":
+                STATE["spent_live"] = round(max(0.0, STATE["spent_live"] - sh), 2)
+            elif was_live is not None and outcome == "open":
+                STATE["spent_live"] = round(max(0.0, STATE["spent_live"] - was_live), 2)
+        note = (f"resolved WON (auto-swept) — ${sh:,.2f} freed to budget" if outcome == "won" else
+                f"buy never filled on-chain — ${was_live or 0:,.2f} refunded to budget" if outcome == "open" else
+                "resolved LOST — stays counted against budget")
+        logline(hist=True, kind="live" if outcome == "won" else "skip",
+                side="GHOST", name=name, shares=sh, note=note)
+        save_state()
 
 
 def settle_resolved():
@@ -517,6 +585,8 @@ def execute(it):
         with LOCK:
             delta = shares if side == "BUY" else -shares
             STATE["holdings"][tid] = round(STATE["holdings"].get(tid, 0.0) + delta, 2)
+            if side == "BUY":
+                STATE["bought_at"][tid] = time.time()
     save_state()
 
 
@@ -967,6 +1037,7 @@ def bot_loop():
                     STATE["leaders"] = leaders
         fetch_wallet()
         settle_resolved()
+        reconcile_ghosts()
         polls += 1
 
         if not TARGETS:
@@ -1679,6 +1750,26 @@ def _check():
     settle_resolved()
     assert STATE["spent_live"] == 8.0 and not STATE["live_cost"]
     assert all(t not in STATE["holdings"] for t in ("w1", "w2", "w3"))
+    STATE["wallet"] = {}
+    # ghost reconcile: API-invisible holdings settled by chain balance + market outcome
+    class _FakeCl:
+        def update_balance_allowance(self, p):
+            pass
+        def get_balance_allowance(self, p):
+            return {"balance": 0}
+    _states = {"g1": "won", "g2": "lost", "g3": "open"}
+    globals()["get_client"], _real_ms = (lambda: _FakeCl()), market_state
+    globals()["market_state"] = lambda tid: _states.get(tid)  # unknown tokens: the skip path
+    STATE["holdings"].update({"g1": 2.0, "g2": 3.0, "g3": 4.0})
+    STATE["live_cost"] = {"g1": 1.0, "g2": 1.1, "g3": 1.2}
+    STATE["bought_at"] = {}          # no timestamp = old enough to reconcile
+    STATE["spent_live"] = 10.0
+    STATE["wallet"] = {"positions": []}  # nothing visible -> all three are ghosts
+    reconcile_ghosts()
+    # won g1 frees shares×$1 (2.0); lost g2 stays; open g3 was a zero-fill -> refund cost (1.2)
+    assert STATE["spent_live"] == 6.8, STATE["spent_live"]
+    assert not STATE["live_cost"] and all(t not in STATE["holdings"] for t in ("g1", "g2", "g3"))
+    globals()["market_state"] = _real_ms
     STATE["wallet"] = {}
     assert any("1 buys" in x for x in copy_stats([{"side": "BUY", "size": 100, "price": 0.5}]))
     a1, a2 = "0x" + "1" * 40, "0x" + "2" * 40
