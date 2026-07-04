@@ -333,6 +333,19 @@ def market_state(tid):
             return "won" if px[toks.index(tid)] > 0.5 else "lost"
     except Exception:
         pass
+    try:  # negRisk sports tokens are invisible to gamma — the CLOB price tape isn't:
+        # a tape that stopped hours ago pinned at 0/1 is a resolved market
+        r = requests.get(f"{CLOB_HOST}/prices-history",
+                         params={"market": tid, "interval": "1w", "fidelity": 60}, timeout=10)
+        h = (r.json() or {}).get("history") or []
+        if h and time.time() - h[-1].get("t", 0) > 7200:
+            p = float(h[-1].get("p", 0.5))
+            if p > 0.98:
+                return "won"
+            if p < 0.02:
+                return "lost"
+    except Exception:
+        pass
     return None
 
 
