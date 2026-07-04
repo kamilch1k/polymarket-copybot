@@ -47,6 +47,7 @@ SLIPPAGE = 0.02              # accept up to this much worse than his fill
 MIN_HIS_NOTIONAL = 0.0        # copy his BUY only if he put >= this many $ in (0 = no floor)
 SPEND_CAP = 15.0             # hard stop: total live BUY $ the bot may ever spend (sells always allowed)
 MAX_DAYS_OUT = 0.0           # only copy BUYs on markets ending within N days (0 = any horizon)
+AUTO_CAP_RESERVE = 8.0       # auto-budget: SPEND_CAP = wallet total − this reserve (0 = manual cap)
 MODE = "auto"                 # "auto" = copy instantly · "approve" = queue for your click
 POLL_SECONDS = 15             # REST polling is the fallback; WebSocket is the fast path
 LEADERS_EVERY = 20            # refresh leaderboard every N polls (~5 min)
@@ -211,6 +212,7 @@ def load_config():
     SIGNATURE_TYPE = c.get("sig_type", SIGNATURE_TYPE)
     globals()["SPEND_CAP"] = c.get("spend_cap", SPEND_CAP)
     globals()["MAX_DAYS_OUT"] = c.get("max_days_out", MAX_DAYS_OUT)
+    globals()["AUTO_CAP_RESERVE"] = c.get("auto_cap_reserve", AUTO_CAP_RESERVE)
     STATE["funder"] = c.get("funder", "")
 
 
@@ -220,6 +222,7 @@ def save_config():
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
         "mode": MODE, "min_his": MIN_HIS_NOTIONAL, "sig_type": SIGNATURE_TYPE,
         "spend_cap": SPEND_CAP, "max_days_out": MAX_DAYS_OUT,
+        "auto_cap_reserve": AUTO_CAP_RESERVE,
         "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
 
@@ -398,6 +401,24 @@ def reconcile_ghosts():
         logline(hist=True, kind="live" if outcome == "won" else "skip",
                 side="GHOST", name=name, shares=sh, note=note)
         save_state()
+
+
+def auto_cap():
+    """SPEND_CAP follows the wallet: on-chain total minus a safety reserve.
+    The budget then breathes with wins/losses instead of needing manual bumps."""
+    if AUTO_CAP_RESERVE <= 0:
+        return
+    with LOCK:
+        w = dict(STATE["wallet"])
+    cash = w.get("usdc")
+    if cash is None:
+        return  # chain read failed this cycle; keep the last cap, don't jerk it around
+    total = cash + sum(float(p.get("currentValue") or 0) for p in w.get("positions", []))
+    new = max(0.0, round(total - AUTO_CAP_RESERVE, 2))
+    if abs(new - SPEND_CAP) >= 1.0:
+        logline(kind="skip", note=f"auto-budget: cap ${SPEND_CAP:.2f} → ${new:.2f} "
+                                  f"(wallet ${total:.2f} − ${AUTO_CAP_RESERVE:g} reserve)")
+    globals()["SPEND_CAP"] = new
 
 
 def settle_resolved():
@@ -1053,6 +1074,7 @@ def bot_loop():
         fetch_wallet()
         settle_resolved()
         reconcile_ghosts()
+        auto_cap()
         polls += 1
 
         if not TARGETS:
@@ -1353,6 +1375,7 @@ def _settings_form():
   <label>Copy his BUY only if ≥ $<input name=min_his value="{MIN_HIS_NOTIONAL}"></label>
   <label>Hard stop: total live buys ≤ $<input name=spend_cap value="{SPEND_CAP}"></label>
   <label>Only copy markets ending within <input name=max_days_out value="{MAX_DAYS_OUT:g}"> days (0 = any horizon; sells always follow)</label>
+  <label>Auto budget: cap = wallet total − $<input name=auto_cap_reserve value="{AUTO_CAP_RESERVE:g}"> reserve (0 = off, manual cap above applies)</label>
   <label>Slippage<input name=slippage value="{SLIPPAGE}"></label>
   <label>Bankroll $<input name=bankroll value="{BANKROLL}"></label>
   <button class=save type=submit>Save</button>
@@ -1666,6 +1689,7 @@ class Handler(BaseHTTPRequestHandler):
             MIN_HIS_NOTIONAL = num("min_his", MIN_HIS_NOTIONAL)
             globals()["SPEND_CAP"] = num("spend_cap", SPEND_CAP)
             globals()["MAX_DAYS_OUT"] = num("max_days_out", MAX_DAYS_OUT)
+            globals()["AUTO_CAP_RESERVE"] = num("auto_cap_reserve", AUTO_CAP_RESERVE)
             SLIPPAGE = num("slippage", SLIPPAGE)
             BANKROLL = num("bankroll", BANKROLL)
             save_config()
@@ -1805,6 +1829,20 @@ def _check():
     STATE["spent_live"], globals()["SPEND_CAP"] = 19.50, 20.0
     assert not over_budget(0.49) and over_budget(0.51)
     STATE["spent_live"] = 0.0
+    # auto budget: cap follows wallet total minus reserve; 0 disables it
+    STATE["wallet"] = {"usdc": 50.0, "positions": [{"currentValue": 3.0}]}
+    globals()["AUTO_CAP_RESERVE"] = 8.0
+    auto_cap()
+    assert SPEND_CAP == 45.0
+    globals()["AUTO_CAP_RESERVE"], globals()["SPEND_CAP"] = 0.0, 20.0
+    auto_cap()
+    assert SPEND_CAP == 20.0                       # disabled -> manual cap untouched
+    STATE["wallet"] = {"usdc": None}
+    globals()["AUTO_CAP_RESERVE"], globals()["SPEND_CAP"] = 8.0, 20.0
+    auto_cap()
+    assert SPEND_CAP == 20.0                       # unreadable chain -> keep last cap
+    globals()["AUTO_CAP_RESERVE"] = 8.0
+    STATE["wallet"] = {}
     # wallet sell button: renders per live position, DRY mode refuses politely
     STATE["wallet"] = {"positions": [{"asset": "tok9", "title": "T9", "outcome": "Yes",
                                       "size": 10, "avgPrice": 0.5, "curPrice": 0.5,
