@@ -1373,13 +1373,28 @@ def _settings_form():
   <label>Copy fraction<input name=fraction value="{COPY_FRACTION}"></label>
   <label>Max $ / trade<input name=cap value="{MAX_USDC_PER_TRADE}"></label>
   <label>Copy his BUY only if ≥ $<input name=min_his value="{MIN_HIS_NOTIONAL}"></label>
-  <label>Hard stop: total live buys ≤ $<input name=spend_cap value="{SPEND_CAP}"></label>
+  <label>Hard stop: total live buys ≤ $<input name=spend_cap id=capin value="{SPEND_CAP}">
+    <span id=capnote class=dim style="display:none">← overridden while auto budget is on</span></label>
   <label>Only copy markets ending within <input name=max_days_out value="{MAX_DAYS_OUT:g}"> days (0 = any horizon; sells always follow)</label>
-  <label>Auto budget: cap = wallet total − $<input name=auto_cap_reserve value="{AUTO_CAP_RESERVE:g}"> reserve (0 = off, manual cap above applies)</label>
+  <label>Auto budget: cap = wallet total − $<input name=auto_cap_reserve id=acr value="{AUTO_CAP_RESERVE:g}"> reserve (0 = off, manual cap above applies)</label>
   <label>Slippage<input name=slippage value="{SLIPPAGE}"></label>
   <label>Bankroll $<input name=bankroll value="{BANKROLL}"></label>
   <button class=save type=submit>Save</button>
 </form>
+<script>
+(function() {{
+  var acr = document.getElementById('acr'), cap = document.getElementById('capin'),
+      note = document.getElementById('capnote');
+  function sync() {{
+    var on = parseFloat(acr.value) > 0;
+    cap.style.opacity = on ? 0.35 : 1;
+    cap.title = on ? 'auto budget is active — this manual cap is ignored while reserve > 0' : '';
+    note.style.display = on ? '' : 'none';
+  }}
+  acr.addEventListener('input', sync);
+  sync();
+}})();
+</script>
 </div>"""
 
 
@@ -1854,6 +1869,7 @@ def _check():
     STATE["wallet"] = {}
     page = render()
     assert "copybot" in page and "Settings" in page and "leaderboard" in page and "Trade history" in page
+    assert "capnote" in page and "id=acr" in page  # manual cap dims while auto budget is on
     assert "Ask Claude" in page and "action=/ask" in page
     STATE["missing_deps"] = ["regex"]  # banner surfaces missing runtime deps
     assert "Missing Python modules" in render_dyn() and "pip install regex" in render_dyn()
