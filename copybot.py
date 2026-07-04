@@ -48,6 +48,7 @@ MIN_HIS_NOTIONAL = 0.0        # copy his BUY only if he put >= this many $ in (0
 SPEND_CAP = 15.0             # hard stop: total live BUY $ the bot may ever spend (sells always allowed)
 MAX_DAYS_OUT = 0.0           # only copy BUYs on markets ending within N days (0 = any horizon)
 AUTO_CAP_RESERVE = 8.0       # auto-budget: SPEND_CAP = wallet total − this reserve (0 = manual cap)
+AUTO_TRADE_PCT = 10.0        # auto-size: MAX_USDC_PER_TRADE = this % of wallet, $5 floor (0 = manual)
 MODE = "auto"                 # "auto" = copy instantly · "approve" = queue for your click
 POLL_SECONDS = 15             # REST polling is the fallback; WebSocket is the fast path
 LEADERS_EVERY = 20            # refresh leaderboard every N polls (~5 min)
@@ -213,6 +214,7 @@ def load_config():
     globals()["SPEND_CAP"] = c.get("spend_cap", SPEND_CAP)
     globals()["MAX_DAYS_OUT"] = c.get("max_days_out", MAX_DAYS_OUT)
     globals()["AUTO_CAP_RESERVE"] = c.get("auto_cap_reserve", AUTO_CAP_RESERVE)
+    globals()["AUTO_TRADE_PCT"] = c.get("auto_trade_pct", AUTO_TRADE_PCT)
     STATE["funder"] = c.get("funder", "")
 
 
@@ -222,7 +224,7 @@ def save_config():
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
         "mode": MODE, "min_his": MIN_HIS_NOTIONAL, "sig_type": SIGNATURE_TYPE,
         "spend_cap": SPEND_CAP, "max_days_out": MAX_DAYS_OUT,
-        "auto_cap_reserve": AUTO_CAP_RESERVE,
+        "auto_cap_reserve": AUTO_CAP_RESERVE, "auto_trade_pct": AUTO_TRADE_PCT,
         "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
 
@@ -404,21 +406,28 @@ def reconcile_ghosts():
 
 
 def auto_cap():
-    """SPEND_CAP follows the wallet: on-chain total minus a safety reserve.
-    The budget then breathes with wins/losses instead of needing manual bumps."""
-    if AUTO_CAP_RESERVE <= 0:
+    """Wallet-driven sizing: SPEND_CAP = total − reserve, MAX_USDC_PER_TRADE = %
+    of total ($5 floor). Budgets then breathe with wins/losses, no manual bumps."""
+    if AUTO_CAP_RESERVE <= 0 and AUTO_TRADE_PCT <= 0:
         return
     with LOCK:
         w = dict(STATE["wallet"])
     cash = w.get("usdc")
     if cash is None:
-        return  # chain read failed this cycle; keep the last cap, don't jerk it around
+        return  # chain read failed this cycle; keep the last values, don't jerk around
     total = cash + sum(float(p.get("currentValue") or 0) for p in w.get("positions", []))
-    new = max(0.0, round(total - AUTO_CAP_RESERVE, 2))
-    if abs(new - SPEND_CAP) >= 1.0:
-        logline(kind="skip", note=f"auto-budget: cap ${SPEND_CAP:.2f} → ${new:.2f} "
-                                  f"(wallet ${total:.2f} − ${AUTO_CAP_RESERVE:g} reserve)")
-    globals()["SPEND_CAP"] = new
+    if AUTO_CAP_RESERVE > 0:
+        new = max(0.0, round(total - AUTO_CAP_RESERVE, 2))
+        if abs(new - SPEND_CAP) >= 1.0:
+            logline(kind="skip", note=f"auto-budget: cap ${SPEND_CAP:.2f} → ${new:.2f} "
+                                      f"(wallet ${total:.2f} − ${AUTO_CAP_RESERVE:g} reserve)")
+        globals()["SPEND_CAP"] = new
+    if AUTO_TRADE_PCT > 0:
+        newc = max(5.0, round(total * AUTO_TRADE_PCT / 100, 2))
+        if abs(newc - MAX_USDC_PER_TRADE) >= 0.5:
+            logline(kind="skip", note=f"auto-size: per-trade cap ${MAX_USDC_PER_TRADE:.2f} → ${newc:.2f} "
+                                      f"({AUTO_TRADE_PCT:g}% of ${total:.2f} wallet)")
+        globals()["MAX_USDC_PER_TRADE"] = newc
 
 
 def settle_resolved():
@@ -1371,28 +1380,45 @@ def _settings_form():
     <option value=approve {"selected" if MODE == "approve" else ""}>approve — I click ✓ per trade</option>
   </select></label>
   <label>Copy fraction<input name=fraction value="{COPY_FRACTION}"></label>
-  <label>Max $ / trade<input name=cap value="{MAX_USDC_PER_TRADE}"></label>
+  <label>Max $ / trade<input name=cap id=tcap value="{MAX_USDC_PER_TRADE}">
+    <span id=tcapnote class=dim style="display:none">← auto-sized from wallet</span></label>
   <label>Copy his BUY only if ≥ $<input name=min_his value="{MIN_HIS_NOTIONAL}"></label>
   <label>Hard stop: total live buys ≤ $<input name=spend_cap id=capin value="{SPEND_CAP}">
     <span id=capnote class=dim style="display:none">← overridden while auto budget is on</span></label>
   <label>Only copy markets ending within <input name=max_days_out value="{MAX_DAYS_OUT:g}"> days (0 = any horizon; sells always follow)</label>
-  <label>Auto budget: cap = wallet total − $<input name=auto_cap_reserve id=acr value="{AUTO_CAP_RESERVE:g}"> reserve (0 = off, manual cap above applies)</label>
+  <label><input type=checkbox id=acr_on style="width:auto"> Auto budget: cap = wallet total − $<input name=auto_cap_reserve id=acr value="{AUTO_CAP_RESERVE:g}"> reserve</label>
+  <label><input type=checkbox id=atp_on style="width:auto"> Auto per-trade cap: <input name=auto_trade_pct id=atp value="{AUTO_TRADE_PCT:g}"> % of wallet ($5 floor)</label>
   <label>Slippage<input name=slippage value="{SLIPPAGE}"></label>
   <label>Bankroll $<input name=bankroll value="{BANKROLL}"></label>
   <button class=save type=submit>Save</button>
 </form>
 <script>
 (function() {{
-  var acr = document.getElementById('acr'), cap = document.getElementById('capin'),
-      note = document.getElementById('capnote');
-  function sync() {{
-    var on = parseFloat(acr.value) > 0;
-    cap.style.opacity = on ? 0.35 : 1;
-    cap.title = on ? 'auto budget is active — this manual cap is ignored while reserve > 0' : '';
-    note.style.display = on ? '' : 'none';
+  // checkbox IS the toggle: unchecking writes 0 into the field (= off on Save),
+  // re-checking restores the previous value (or the default).
+  function wire(chkId, numId, dimIds, noteId, dflt) {{
+    var chk = document.getElementById(chkId), num = document.getElementById(numId),
+        note = document.getElementById(noteId);
+    function sync() {{
+      var on = parseFloat(num.value) > 0;
+      chk.checked = on;
+      dimIds.forEach(function(id) {{
+        var el = document.getElementById(id);
+        el.style.opacity = on ? 0.35 : 1;
+        el.title = on ? 'auto-managed — ignored while the auto toggle is on' : '';
+      }});
+      note.style.display = on ? '' : 'none';
+    }}
+    chk.addEventListener('change', function() {{
+      if (chk.checked) {{ num.value = num.dataset.prev > 0 ? num.dataset.prev : dflt; }}
+      else {{ num.dataset.prev = parseFloat(num.value) || dflt; num.value = 0; }}
+      sync();
+    }});
+    num.addEventListener('input', sync);
+    sync();
   }}
-  acr.addEventListener('input', sync);
-  sync();
+  wire('acr_on', 'acr', ['capin'], 'capnote', 8);
+  wire('atp_on', 'atp', ['tcap'], 'tcapnote', 10);
 }})();
 </script>
 </div>"""
@@ -1705,6 +1731,7 @@ class Handler(BaseHTTPRequestHandler):
             globals()["SPEND_CAP"] = num("spend_cap", SPEND_CAP)
             globals()["MAX_DAYS_OUT"] = num("max_days_out", MAX_DAYS_OUT)
             globals()["AUTO_CAP_RESERVE"] = num("auto_cap_reserve", AUTO_CAP_RESERVE)
+            globals()["AUTO_TRADE_PCT"] = num("auto_trade_pct", AUTO_TRADE_PCT)
             SLIPPAGE = num("slippage", SLIPPAGE)
             BANKROLL = num("bankroll", BANKROLL)
             save_config()
@@ -1846,17 +1873,23 @@ def _check():
     STATE["spent_live"] = 0.0
     # auto budget: cap follows wallet total minus reserve; 0 disables it
     STATE["wallet"] = {"usdc": 50.0, "positions": [{"currentValue": 3.0}]}
-    globals()["AUTO_CAP_RESERVE"] = 8.0
+    globals()["AUTO_CAP_RESERVE"], globals()["AUTO_TRADE_PCT"] = 8.0, 10.0
     auto_cap()
     assert SPEND_CAP == 45.0
-    globals()["AUTO_CAP_RESERVE"], globals()["SPEND_CAP"] = 0.0, 20.0
+    assert MAX_USDC_PER_TRADE == 5.3               # 10% of $53 wallet
+    STATE["wallet"] = {"usdc": 20.0, "positions": []}
     auto_cap()
-    assert SPEND_CAP == 20.0                       # disabled -> manual cap untouched
+    assert MAX_USDC_PER_TRADE == 5.0               # small wallet -> $5 floor holds
+    globals()["AUTO_CAP_RESERVE"], globals()["SPEND_CAP"] = 0.0, 20.0
+    globals()["AUTO_TRADE_PCT"], globals()["MAX_USDC_PER_TRADE"] = 0.0, 5.0
+    auto_cap()
+    assert SPEND_CAP == 20.0 and MAX_USDC_PER_TRADE == 5.0   # disabled -> untouched
     STATE["wallet"] = {"usdc": None}
     globals()["AUTO_CAP_RESERVE"], globals()["SPEND_CAP"] = 8.0, 20.0
     auto_cap()
     assert SPEND_CAP == 20.0                       # unreadable chain -> keep last cap
-    globals()["AUTO_CAP_RESERVE"] = 8.0
+    globals()["AUTO_CAP_RESERVE"], globals()["AUTO_TRADE_PCT"] = 8.0, 10.0
+    globals()["MAX_USDC_PER_TRADE"] = 5.0
     STATE["wallet"] = {}
     # wallet sell button: renders per live position, DRY mode refuses politely
     STATE["wallet"] = {"positions": [{"asset": "tok9", "title": "T9", "outcome": "Yes",
