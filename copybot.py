@@ -1386,8 +1386,12 @@ def _settings_form():
   <label>Hard stop: total live buys ≤ $<input name=spend_cap id=capin value="{SPEND_CAP}">
     <span id=capnote class=dim style="display:none">← overridden while auto budget is on</span></label>
   <label>Only copy markets ending within <input name=max_days_out value="{MAX_DAYS_OUT:g}"> days (0 = any horizon; sells always follow)</label>
-  <label><input type=checkbox id=acr_on style="width:auto"> Auto budget: cap = wallet total − $<input name=auto_cap_reserve id=acr value="{AUTO_CAP_RESERVE:g}"> reserve</label>
-  <label><input type=checkbox id=atp_on style="width:auto"> Auto per-trade cap: <input name=auto_trade_pct id=atp value="{AUTO_TRADE_PCT:g}"> % of wallet ($5 floor)</label>
+  <label><span style="display:flex;align-items:center;gap:6px"><input type=checkbox id=acr_on style="width:auto;margin:0">
+    Auto budget — cap = wallet total minus this $ reserve (uncheck for manual cap)</span>
+    <input name=auto_cap_reserve id=acr value="{AUTO_CAP_RESERVE:g}"></label>
+  <label><span style="display:flex;align-items:center;gap:6px"><input type=checkbox id=atp_on style="width:auto;margin:0">
+    Auto per-trade cap — this % of wallet, $5 floor (uncheck for manual)</span>
+    <input name=auto_trade_pct id=atp value="{AUTO_TRADE_PCT:g}"></label>
   <label>Slippage<input name=slippage value="{SLIPPAGE}"></label>
   <label>Bankroll $<input name=bankroll value="{BANKROLL}"></label>
   <button class=save type=submit>Save</button>
