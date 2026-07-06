@@ -1,11 +1,12 @@
 # Copybot watchdog: app health + Polymarket connection + missed-trade audit.
 # Read-only: never trades, never changes state. Prints a compact report.
 import json, re, sys, time
+from pathlib import Path
 import requests
 
 APP = "http://127.0.0.1:8777/dyn"
-CONFIG = r"C:\cc\copybot\copybot_config.json"
-STATE = r"C:\cc\copybot\copybot_state.json"
+CONFIG = Path(__file__).with_name("copybot_config.json")   # portable: same dir as this script
+STATE = Path(__file__).with_name("copybot_state.json")
 GRACE = 300          # seconds a trade may sit unprocessed before it counts as missed
 LOOKBACK = 25 * 60   # audit window > loop interval (15 min) so nothing falls between firings
 

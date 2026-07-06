@@ -1956,6 +1956,11 @@ if __name__ == "__main__":
         threading.Thread(target=ws_loop, daemon=True).start()
         threading.Thread(target=server.serve_forever, daemon=True).start()
         print(f"copybot: {url}")
+    if "--headless" in sys.argv:  # service/VPS mode: engine + HTTP UI, no window
+        if not server:
+            sys.exit("copybot: port in use — another instance is already running")
+        while True:
+            time.sleep(3600)
     try:
         import webview  # native desktop window (Windows WebView2)
         webview.create_window("Copybot", url, width=1180, height=920)

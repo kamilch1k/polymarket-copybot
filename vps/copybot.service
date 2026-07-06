@@ -1,0 +1,14 @@
+[Unit]
+Description=Polymarket copybot (headless)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=copybot
+WorkingDirectory=/opt/copybot
+ExecStart=/opt/copybot/venv/bin/python /opt/copybot/copybot.py --headless
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
