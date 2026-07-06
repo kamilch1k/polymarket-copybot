@@ -9,7 +9,7 @@ apt-get -y install python3-venv unattended-upgrades ufw
 
 id -u copybot &>/dev/null || useradd -r -d /opt/copybot -s /usr/sbin/nologin copybot
 python3 -m venv /opt/copybot/venv
-/opt/copybot/venv/bin/pip install -q requests websocket-client regex py-clob-client-v2
+/opt/copybot/venv/bin/pip install -q requests websocket-client regex py-clob-client-v2 eth-utils eth-account
 
 chown -R copybot:copybot /opt/copybot
 chmod 600 /opt/copybot/copybot_config.json   # holds the wallet key

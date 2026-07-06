@@ -54,6 +54,7 @@ POLL_SECONDS = 15             # REST polling is the fallback; WebSocket is the f
 LEADERS_EVERY = 20            # refresh leaderboard every N polls (~5 min)
 SIGNATURE_TYPE = 3            # 1 = old email/magic · 2 = browser wallet · 3 = new Polymarket wallet (2026+). Auto-detected.
 PORT = 8777
+HEADLESS = False              # set by --headless: no window, systemd owns the lifecycle
 PRIVATE_KEY_MEM = None        # persisted to config by owner's choice (single-user PC)
 CONFIG_FILE = Path(__file__).with_name("copybot_config.json")
 STATE_FILE = Path(__file__).with_name("copybot_state.json")
@@ -1798,8 +1799,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/openpm":  # open a Polymarket profile in the system browser
             addr = f.get("addr", [""])[0].strip()
             if valid_addr(addr):
-                import webbrowser
-                webbrowser.open(f"https://polymarket.com/profile/{addr}")
+                try:  # no browser/DISPLAY on a headless VPS — never crash the handler
+                    webbrowser.open(f"https://polymarket.com/profile/{addr}")
+                except Exception:
+                    pass
         elif path == "/ask":
             q = f.get("q", [""])[0].strip()
             if q and not STATE["thinking"]:
@@ -1861,6 +1864,9 @@ class Handler(BaseHTTPRequestHandler):
             save_config()
             try_go_live("settings saved")  # fully configured -> start trading immediately
         elif path == "/kill":
+            if HEADLESS:  # on a VPS the process is systemd-managed, not window-bound
+                self._send(200, "headless: use `systemctl stop copybot` on the server")
+                return
             self._send(200, "bye")
             os._exit(0)  # ponytail: abrupt, but it's a side-project button
         self._redirect()
@@ -2111,6 +2117,12 @@ def _check():
     tinted = [i for i, c in enumerate(chunks) if "rgba(74,222,128" in c]
     assert tinted == [0], tinted  # only the in-horizon open BUY; far/ended/sell stay plain
     globals()["MAX_DAYS_OUT"] = _mdo
+
+    # headless guard: the flag exists and defaults off; /kill honors it (VPS = systemd-owned)
+    assert HEADLESS is False  # desktop default; --headless flips it in __main__
+    src = _order.__globals__["Handler"].do_POST.__code__.co_consts
+    assert any(isinstance(c, str) and "systemctl stop copybot" in c for c in src), \
+        "/kill headless guard missing"
     print("self-check OK")
 
 
@@ -2118,6 +2130,7 @@ if __name__ == "__main__":
     if "--check" in sys.argv:
         _check()
         sys.exit()
+    HEADLESS = "--headless" in sys.argv
     url = f"http://127.0.0.1:{PORT}"
     ThreadingHTTPServer.allow_reuse_address = False  # else two instances share the port on Windows
     try:
