@@ -745,6 +745,16 @@ def handle(trade):
             INFLIGHT_BUYS.discard(tid)
 
 
+def copy_missed(k):
+    """Feed-row 'copy' button: the owner replays one missed/baselined BUY through
+    the NORMAL pipeline — every gate still applies (no stacking, cooldown, horizon,
+    no-chase vs current mid, auto-sizing). Fires only on the owner's click."""
+    with LOCK:
+        t = next((x for x in STATE["target_feed"] if key(x) == k), None)
+    if t and str(t.get("side", "")).upper() == "BUY":
+        handle(dict(t))
+
+
 def sell_position(tid):
     """Market-sell one on-chain position (the wallet-card sell button). Sells the
     actual held balance, so it also liquidates strays like old test-trade legs."""
@@ -1280,6 +1290,9 @@ def _wallet_card():
 def _target_rows():
     with LOCK:
         feed = list(STATE["target_feed"])[:15]
+        taken = {tid for tid, sh in STATE["holdings"].items() if sh > 0}
+        taken |= {p.get("tid") for p in STATE["pending"].values()}
+        taken |= set(INFLIGHT_BUYS)
     out = ""
     for t in feed:
         side = str(t.get("side", "")).upper()
@@ -1287,10 +1300,16 @@ def _target_rows():
         name = f"{t.get('title', '?')} — {t.get('outcome', '?')}"
         ts = t.get("timestamp")
         when = time.strftime("%m-%d %H:%M", time.localtime(float(ts))) if ts else ""
+        act = ""
+        if side == "BUY" and t.get("asset") not in taken:
+            act = (f'<form method=post action=/copymiss style=display:inline>'
+                   f'<input type=hidden name=k value="{html.escape(key(t))}">'
+                   f'<button class=copy title="copy this trade now — goes through the normal '
+                   f'gates (no stacking, no chasing, horizon, auto-size)">copy</button></form>')
         out += (f'<tr><td class=dim>{when}</td>'
                 f'<td class=dim>{t.get("_who", "")}</td><td style=color:{col}>{side}</td><td>{name}</td>'
-                f'<td class=r>{float(t.get("size", 0)):g}</td><td class=r>@{t.get("price", "")}</td></tr>')
-    return out or "<tr><td colspan=6 class=dim>no recent activity</td></tr>"
+                f'<td class=r>{float(t.get("size", 0)):g}</td><td class=r>@{t.get("price", "")}</td><td>{act}</td></tr>')
+    return out or "<tr><td colspan=7 class=dim>no recent activity</td></tr>"
 
 
 def _status_card():
@@ -1513,7 +1532,7 @@ def render_dyn():
   </div>
   <div class=card>
     <h2>Targets — live activity</h2>
-    <table><tr><th>when</th><th>trader</th><th>side</th><th>market — outcome</th><th class=r>size</th><th class=r>px</th></tr>{_target_rows()}</table>
+    <table><tr><th>when</th><th>trader</th><th>side</th><th>market — outcome</th><th class=r>size</th><th class=r>px</th><th></th></tr>{_target_rows()}</table>
     <h2>How to copy him best</h2>
     <ul class=tips>{stats}</ul>
   </div>
@@ -1675,6 +1694,10 @@ class Handler(BaseHTTPRequestHandler):
             tid = f.get("tid", [""])[0].strip()
             if tid:
                 threading.Thread(target=sell_position, args=(tid,), daemon=True).start()
+        elif path == "/copymiss":  # feed-row copy button: owner replays a missed BUY
+            k = f.get("k", [""])[0].strip()
+            if k:
+                threading.Thread(target=copy_missed, args=(k,), daemon=True).start()
         elif path == "/openpm":  # open a Polymarket profile in the system browser
             addr = f.get("addr", [""])[0].strip()
             if valid_addr(addr):
@@ -1934,6 +1957,23 @@ def _check():
     assert "1 settled/worthless positions hidden" in card      # dust collapsed
     STATE["wallet"] = {"usdc": 0.0, "checked": "0x" + "b" * 40, "positions": []}
     assert "empty on-chain" in _wallet_card()  # wrong-wallet warning fires
+
+    # copy_missed: only a real feed BUY replays, and through the normal handle()
+    calls = []
+    _oh = handle
+    globals()["handle"] = lambda t: calls.append(t["asset"])
+    STATE["target_feed"] = [
+        {"transactionHash": "0xh1", "asset": "tokS", "side": "SELL", "price": 0.5, "size": 9},
+        {"transactionHash": "0xh2", "asset": "tokB", "side": "BUY", "price": 0.5, "size": 9}]
+    copy_missed("0xh1:tokS:SELL")
+    copy_missed("0xh2:tokB:BUY")
+    copy_missed("bogus")
+    globals()["handle"] = _oh
+    assert calls == ["tokB"], calls
+    assert "/copymiss" in _target_rows()   # un-held BUY row gets its copy button
+    STATE["holdings"]["tokB"] = 5.0
+    assert "/copymiss" not in _target_rows()  # held -> button gone (no stacking)
+    del STATE["holdings"]["tokB"]
     print("self-check OK")
 
 
