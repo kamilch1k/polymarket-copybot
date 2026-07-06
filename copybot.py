@@ -1151,6 +1151,9 @@ def bot_loop():
         with LOCK:
             STATE["target_feed"] = merged[:25]
         save_state()
+        for t in merged[:25]:  # warm end-date cache so the feed can tint copyable rows
+            if str(t.get("side", "")).upper() == "BUY":
+                market_end_ts(t.get("asset"))
         time.sleep(POLL_SECONDS)
 
 
@@ -1294,6 +1297,7 @@ def _target_rows():
         taken |= {p.get("tid") for p in STATE["pending"].values()}
         taken |= set(INFLIGHT_BUYS)
     out = ""
+    now = time.time()
     for t in feed:
         side = str(t.get("side", "")).upper()
         col = "#4ade80" if side == "BUY" else "#fca5a5"
@@ -1306,7 +1310,13 @@ def _target_rows():
                    f'<input type=hidden name=k value="{html.escape(key(t))}">'
                    f'<button class=copy title="copy this trade now — goes through the normal '
                    f'gates (no stacking, no chasing, horizon, auto-size)">copy</button></form>')
-        out += (f'<tr><td class=dim>{when}</td>'
+        # tint = this row would actually copy if clicked: fresh BUY, not held, market
+        # still open and inside the horizon cap (cache-only check; price gate at click)
+        ets = ENDS_CACHE.get(t.get("asset"))
+        good = (act and ets and ets > now
+                and (MAX_DAYS_OUT <= 0 or ets - now <= MAX_DAYS_OUT * 86400))
+        tint = ' style="background:rgba(74,222,128,.08)"' if good else ""
+        out += (f'<tr{tint}><td class=dim>{when}</td>'
                 f'<td class=dim>{t.get("_who", "")}</td><td style=color:{col}>{side}</td><td>{name}</td>'
                 f'<td class=r>{float(t.get("size", 0)):g}</td><td class=r>@{t.get("price", "")}</td><td>{act}</td></tr>')
     return out or "<tr><td colspan=7 class=dim>no recent activity</td></tr>"
@@ -1974,6 +1984,21 @@ def _check():
     STATE["holdings"]["tokB"] = 5.0
     assert "/copymiss" not in _target_rows()  # held -> button gone (no stacking)
     del STATE["holdings"]["tokB"]
+
+    # green tint marks exactly the rows that would copy: open market inside horizon
+    _mdo = MAX_DAYS_OUT
+    globals()["MAX_DAYS_OUT"] = 2.0
+    nowt = time.time()
+    STATE["target_feed"] = [
+        {"transactionHash": "0x1", "asset": "tokIn", "side": "BUY", "price": 0.5, "size": 9, "title": "T-in"},
+        {"transactionHash": "0x2", "asset": "tokFar", "side": "BUY", "price": 0.5, "size": 9, "title": "T-far"},
+        {"transactionHash": "0x3", "asset": "tokEnded", "side": "BUY", "price": 0.5, "size": 9, "title": "T-end"},
+        {"transactionHash": "0x4", "asset": "tokIn", "side": "SELL", "price": 0.5, "size": 9, "title": "T-sell"}]
+    ENDS_CACHE.update({"tokIn": nowt + 3600, "tokFar": nowt + 90 * 86400, "tokEnded": nowt - 3600})
+    chunks = _target_rows().split("<tr")[1:]
+    tinted = [i for i, c in enumerate(chunks) if "rgba(74,222,128" in c]
+    assert tinted == [0], tinted  # only the in-horizon open BUY; far/ended/sell stay plain
+    globals()["MAX_DAYS_OUT"] = _mdo
     print("self-check OK")
 
 
