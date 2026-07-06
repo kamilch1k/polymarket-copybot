@@ -459,11 +459,10 @@ def reconcile_ghosts():
             STATE["holdings"].pop(tid, None)
             STATE["bought_at"].pop(tid, None)
             if was_live is not None and outcome == "won":
-                # credit the win, but never below what the OTHER live positions
-                # still have at risk (guards against an odometer that lost track)
-                floor = round(sum(STATE["live_cost"].values()), 2)
+                # free this copy's stake (same cost-based model as settle_resolved);
+                # the winnings land in the wallet, never in the in-play figure
                 before = STATE["spent_live"]
-                STATE["spent_live"] = round(max(floor, before - sh), 2)
+                STATE["spent_live"] = round(max(0.0, before - was_live), 2)
                 credited = round(before - STATE["spent_live"], 2)
             elif was_live is not None and outcome == "open":
                 STATE["spent_live"] = round(max(0.0, STATE["spent_live"] - was_live), 2)
@@ -501,9 +500,10 @@ def auto_cap():
 
 
 def settle_resolved():
-    """When a copied position's market resolves, free its budget: a win returns
-    shares×$1 to the wallet, so it is no longer 'in play'. Losses stay counted
-    (still money in the hole). DRY copies just get cleared, never credited."""
+    """When a copied position's market resolves, free its budget: a win frees the
+    stake it consumed (the profit lands in the wallet, not the odometer), so it is
+    no longer 'in play'. Losses stay counted (still money in the hole). DRY copies
+    just get cleared, never credited."""
     with LOCK:
         held = {t: s for t, s in STATE["holdings"].items() if s > 0}
         posmap = {p.get("asset"): p for p in STATE["wallet"].get("positions", [])}
@@ -514,12 +514,13 @@ def settle_resolved():
         won = float(p.get("curPrice") or 0) > 0.5
         name = STATE["names"].get(tid, tid[:16])
         with LOCK:
-            was_live = STATE["live_cost"].pop(tid, None) is not None
+            cost = STATE["live_cost"].pop(tid, None)  # what this copy actually cost us
+            was_live = cost is not None
             STATE["holdings"].pop(tid, None)
-            back = round(sh * 1.0, 2) if (won and was_live) else 0.0
-            if back:
+            back = round(cost, 2) if (won and was_live) else 0.0
+            if back:  # free the stake; the winnings sit in the wallet, not the in-play figure
                 STATE["spent_live"] = round(max(0.0, STATE["spent_live"] - back), 2)
-        note = (f"resolved WON — ${back:,.2f} freed back into budget" if won and was_live else
+        note = (f"resolved WON — ${back:,.2f} stake freed back into budget" if won and was_live else
                 "resolved WON (dry copy — nothing was spent)" if won else
                 "resolved LOST — stays counted against budget")
         logline(hist=True, kind="live" if won else "skip", side="RESOLVE", name=name, shares=sh, note=note)
@@ -1181,6 +1182,10 @@ def bot_loop():
         fetch_wallet()
         settle_resolved()
         reconcile_ghosts()
+        with LOCK:  # in-play can never read below the stakes still on open live copies
+            floor = round(sum(STATE["live_cost"].values()), 2)
+            if STATE["spent_live"] < floor:
+                STATE["spent_live"] = floor
         auto_cap()
         polls += 1
 
@@ -1955,11 +1960,11 @@ def _check():
     STATE["live_cost"] = {"w1": 1.0, "w3": 1.2}
     STATE["spent_live"] = 10.0
     STATE["wallet"] = {"positions": [
-        {"asset": "w1", "redeemable": True, "curPrice": 1},    # live copy, WON  -> +$2 freed
+        {"asset": "w1", "redeemable": True, "curPrice": 1},    # live copy, WON  -> frees $1 stake
         {"asset": "w2", "redeemable": True, "curPrice": 1},    # dry copy, WON   -> no credit
         {"asset": "w3", "redeemable": True, "curPrice": 0}]}   # live copy, LOST -> no credit
     settle_resolved()
-    assert STATE["spent_live"] == 8.0 and not STATE["live_cost"]
+    assert STATE["spent_live"] == 9.0 and not STATE["live_cost"]  # frees w1's $1 cost, not its $2 payout
     assert all(t not in STATE["holdings"] for t in ("w1", "w2", "w3"))
     STATE["wallet"] = {}
     # ghost reconcile: API-invisible holdings settled by chain balance + market outcome
@@ -1977,19 +1982,27 @@ def _check():
     STATE["spent_live"] = 10.0
     STATE["wallet"] = {"positions": []}  # nothing visible -> all three are ghosts
     reconcile_ghosts()
-    # won g1 frees shares×$1 (2.0); lost g2 stays; open g3 was a zero-fill -> refund cost (1.2)
-    assert STATE["spent_live"] == 6.8, STATE["spent_live"]
+    # won g1 frees its $1 cost; lost g2 stays; open g3 was a zero-fill -> refund cost (1.2)
+    assert STATE["spent_live"] == 7.8, STATE["spent_live"]
     assert not STATE["live_cost"] and all(t not in STATE["holdings"] for t in ("g1", "g2", "g3"))
-    # swept-win clamp: credit never dips below what other live positions still risk
+    # a won ghost frees its own stake; other live positions keep their cost counted
     _states["g4"] = "won"
     STATE["holdings"].update({"g4": 8.0, "gX": 1.0})
     STATE["live_cost"] = {"g4": 5.0, "gX": 4.5}
-    STATE["spent_live"] = 9.5                            # odometer lost g4's cost long ago
+    STATE["spent_live"] = 9.5
     STATE["wallet"] = {"positions": [{"asset": "gX"}]}   # gX visible, g4 is the ghost
     reconcile_ghosts()
-    assert STATE["spent_live"] == 4.5, STATE["spent_live"]  # clamped at gX cost, not 9.5-8=1.5
+    assert STATE["spent_live"] == 4.5, STATE["spent_live"]  # frees g4's $5 stake; gX's $4.5 stays
     assert "g4" not in STATE["holdings"] and "g4" not in STATE["live_cost"]
     STATE["holdings"].pop("gX", None)
+    STATE["live_cost"] = {}
+    # in-play floor (bot_loop): spent_live can't read below open live stakes (heals stale under-counts)
+    STATE["live_cost"] = {"z1": 2.17}
+    STATE["spent_live"] = 0.0
+    _floor = round(sum(STATE["live_cost"].values()), 2)
+    if STATE["spent_live"] < _floor:
+        STATE["spent_live"] = _floor
+    assert STATE["spent_live"] == 2.17, STATE["spent_live"]
     STATE["live_cost"] = {}
     globals()["market_state"] = _real_ms
     # synth wallet rows: blind-spot holdings appear, but never fool the reconciler
