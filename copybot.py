@@ -351,7 +351,69 @@ def market_state(tid):
                 return "lost"
     except Exception:
         pass
-    return None
+    return _ctf_payout(tid)  # last resort: on-chain payout record (API-blind proof)
+
+
+CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # Conditional Tokens (Polygon)
+COND_CACHE = {}  # token -> (conditionId, outcomeIndex), learned from our own fills
+
+
+def _cond_of(tid):
+    """conditionId + outcomeIndex for a token we traded, from our own fill records."""
+    if tid in COND_CACHE:
+        return COND_CACHE[tid]
+    funder = STATE.get("funder") or os.environ.get("PM_FUNDER", "")
+    try:
+        for off in (0, 500):
+            rows = requests.get(f"{DATA_API}/activity",
+                                params={"user": funder, "limit": 500, "offset": off}, timeout=10).json()
+            if not isinstance(rows, list) or not rows:
+                break
+            for a in rows:
+                t2, cid = str(a.get("asset", "")), a.get("conditionId")
+                if t2 and cid and a.get("outcomeIndex") is not None and t2 not in COND_CACHE:
+                    COND_CACHE[t2] = (cid, int(a["outcomeIndex"]))
+            if len(rows) < 500:
+                break
+    except Exception:
+        pass
+    return COND_CACHE.setdefault(tid, (None, None))
+
+
+def _ctf_payout(tid):
+    """'won'/'lost' straight from the CTF contract's payout vector, or None while
+    unresolved. Works when gamma, the positions API and the price tape are all
+    blind (negRisk sweeps) — the chain is the settlement-grade source."""
+    cid, idx = _cond_of(tid)
+    if not cid or idx is None:
+        return None
+    try:
+        from eth_utils import keccak
+    except ImportError:
+        return None
+
+    def call(data):
+        for rpc in POLYGON_RPCS:
+            try:
+                r = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                                             "params": [{"to": CTF, "data": data}, "latest"]},
+                                  timeout=10)
+                res = r.json().get("result")
+                if res and res != "0x":
+                    return int(res, 16)
+            except Exception:
+                continue
+        return None
+
+    cid32 = cid[2:].rjust(64, "0")
+    den = call("0x" + keccak(text="payoutDenominator(bytes32)")[:4].hex() + cid32)
+    if not den:
+        return None  # unresolved (or RPC unreachable): no verdict, try again later
+    num = call("0x" + keccak(text="payoutNumerators(bytes32,uint256)")[:4].hex()
+               + cid32 + hex(idx)[2:].rjust(64, "0"))
+    if num is None:
+        return None
+    return "won" if num > 0 else "lost"
 
 
 RECON_NEXT = {}  # token -> don't re-check before this time (API-lag backoff)
@@ -364,7 +426,8 @@ def reconcile_ghosts():
     now = time.time()
     with LOCK:
         held = {t: s for t, s in STATE["holdings"].items() if s > 0}
-        visible = {p.get("asset") for p in STATE["wallet"].get("positions", [])}
+        visible = {p.get("asset") for p in STATE["wallet"].get("positions", [])
+                   if not p.get("_synth")}  # synth rows are ours — they prove nothing
     for tid, sh in held.items():
         if tid in visible or now < RECON_NEXT.get(tid, 0):
             continue
@@ -389,15 +452,21 @@ def reconcile_ghosts():
                 RECON_NEXT[tid] = now + 600  # healthy position; positions API is behind
                 continue
         name = STATE["names"].get(tid, tid[:16])
+        credited = 0.0
         with LOCK:
             was_live = STATE["live_cost"].pop(tid, None)
             STATE["holdings"].pop(tid, None)
             STATE["bought_at"].pop(tid, None)
             if was_live is not None and outcome == "won":
-                STATE["spent_live"] = round(max(0.0, STATE["spent_live"] - sh), 2)
+                # credit the win, but never below what the OTHER live positions
+                # still have at risk (guards against an odometer that lost track)
+                floor = round(sum(STATE["live_cost"].values()), 2)
+                before = STATE["spent_live"]
+                STATE["spent_live"] = round(max(floor, before - sh), 2)
+                credited = round(before - STATE["spent_live"], 2)
             elif was_live is not None and outcome == "open":
                 STATE["spent_live"] = round(max(0.0, STATE["spent_live"] - was_live), 2)
-        note = (f"resolved WON (auto-swept) — ${sh:,.2f} freed to budget" if outcome == "won" else
+        note = (f"resolved WON (auto-swept) — ${credited:,.2f} freed to budget" if outcome == "won" else
                 f"buy never filled on-chain — ${was_live or 0:,.2f} refunded to budget" if outcome == "open" else
                 "resolved LOST — stays counted against budget")
         logline(hist=True, kind="live" if outcome == "won" else "skip",
@@ -456,6 +525,23 @@ def settle_resolved():
         save_state()
 
 
+def _augment_positions(w):
+    """positions-API blind spots (negRisk sweeps): bot-held tokens the API omits
+    still show in the wallet card and count toward the auto-budget total."""
+    have = {p.get("asset") for p in w.get("positions", [])}
+    with LOCK:
+        mine = {t: s for t, s in STATE["holdings"].items() if s > 0 and t not in have}
+        nm = dict(STATE["names"])
+    for t, s in mine.items():
+        px = midpoint(t)
+        full = nm.get(t, t[:14])
+        ti, _, oc = full.rpartition(" — ")
+        w.setdefault("positions", []).append({
+            "asset": t, "title": ti or full, "outcome": oc if ti else "",
+            "size": s, "curPrice": px, "currentValue": round((px or 0) * s, 2),
+            "redeemable": False, "_synth": True})
+
+
 def fetch_wallet():
     """On-chain truth for YOUR funder wallet: cash (direct Polygon query) and open
     positions (public data-api). Shows the exact address checked so a wrong-wallet
@@ -473,6 +559,7 @@ def fetch_wallet():
             w["positions"] = live[:40]
     except Exception:
         pass
+    _augment_positions(w)
     try:  # CLOB "tradeable" balance, if connected — may differ from on-chain (open orders)
         if CLIENT:
             from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
@@ -1887,7 +1974,32 @@ def _check():
     # won g1 frees shares×$1 (2.0); lost g2 stays; open g3 was a zero-fill -> refund cost (1.2)
     assert STATE["spent_live"] == 6.8, STATE["spent_live"]
     assert not STATE["live_cost"] and all(t not in STATE["holdings"] for t in ("g1", "g2", "g3"))
+    # swept-win clamp: credit never dips below what other live positions still risk
+    _states["g4"] = "won"
+    STATE["holdings"].update({"g4": 8.0, "gX": 1.0})
+    STATE["live_cost"] = {"g4": 5.0, "gX": 4.5}
+    STATE["spent_live"] = 9.5                            # odometer lost g4's cost long ago
+    STATE["wallet"] = {"positions": [{"asset": "gX"}]}   # gX visible, g4 is the ghost
+    reconcile_ghosts()
+    assert STATE["spent_live"] == 4.5, STATE["spent_live"]  # clamped at gX cost, not 9.5-8=1.5
+    assert "g4" not in STATE["holdings"] and "g4" not in STATE["live_cost"]
+    STATE["holdings"].pop("gX", None)
+    STATE["live_cost"] = {}
     globals()["market_state"] = _real_ms
+    # synth wallet rows: blind-spot holdings appear, but never fool the reconciler
+    _mid = midpoint
+    globals()["midpoint"] = lambda t: 0.6
+    STATE["holdings"]["gs"] = 5.0
+    STATE["names"]["gs"] = "Some negRisk market — No"
+    _w = {"positions": []}
+    _augment_positions(_w)
+    srow = _w["positions"][-1]
+    assert srow["_synth"] and srow["asset"] == "gs" and srow["currentValue"] == 3.0
+    assert srow["title"] == "Some negRisk market" and srow["outcome"] == "No"
+    assert "gs" not in {p.get("asset") for p in _w["positions"] if not p.get("_synth")}
+    globals()["midpoint"] = _mid
+    STATE["holdings"].pop("gs", None)
+    STATE["names"].pop("gs", None)
     STATE["wallet"] = {}
     assert any("1 buys" in x for x in copy_stats([{"side": "BUY", "size": 100, "price": 0.5}]))
     a1, a2 = "0x" + "1" * 40, "0x" + "2" * 40
