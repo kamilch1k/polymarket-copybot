@@ -240,6 +240,8 @@ def load_state():
     STATE["spent_live"] = s.get("spent_live", 0.0)
     STATE["live_cost"] = s.get("live_cost", {})
     STATE["bought_at"] = s.get("bought_at", {})
+    if audit_ledger_0707():
+        save_state()
 
 
 def save_state():
@@ -249,6 +251,42 @@ def save_state():
                 "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"],
                 "bought_at": STATE["bought_at"]}
     STATE_FILE.write_text(json.dumps(data))
+
+
+LEDGER_AUDIT_0707 = [  # chain-verified 2026-07-07: "never filled" ghosts that were real fills
+    ("Canada vs. Morocco: O/U 2.5 — Under", 3.81, "lost"),
+    ("Canada vs. Morocco: O/U 2.5 — Over", 5.12, "won"),
+    ("Spread: France (-3.5) — Paraguay", 5.51, "won"),
+    ("United States vs. Belgium: Team to Advance — Belgium", 6.55, "won"),
+    ("Spread: Milwaukee Brewers (-1.5) — St. Louis Cardinals", 1.03, "won"),
+    ("Argentina vs. Egypt: 1st Half O/U 0.5 — Over", 6.12, "won"),
+    ("Argentina vs. Egypt: O/U 2.5 — Under", 3.04, "lost"),
+    ("Argentina vs. Egypt: O/U 2.5 — Over", 1.02, "won"),
+]
+
+
+def audit_ledger_0707():
+    """One-time repair for the ghost-detector bug fixed the same day: rewrite the
+    eight chain-verified mislabels in place and re-count the two losses whose cost
+    the bogus 'refund' had freed from the odometer. Idempotent — the 'never filled'
+    marker is gone after the rewrite. Returns how many entries it fixed."""
+    fixed = 0
+    for e in STATE["history"]:
+        if e.get("side") != "GHOST" or "never filled" not in str(e.get("note", "")):
+            continue
+        for name, cost, verdict in LEDGER_AUDIT_0707:
+            if e.get("name") == name and f"${cost:.2f}" in str(e.get("note", "")):
+                if verdict == "won":
+                    e["kind"] = "live"
+                    e["note"] = (f"resolved WON (auto-swept) — ${cost:.2f} freed to budget "
+                                 "[audit: fill was real, payout verified on-chain]")
+                else:
+                    e["kind"] = "skip"
+                    e["note"] = ("resolved LOST — stays counted against budget "
+                                 "[audit: fill was real, payout verified on-chain]")
+                    STATE["spent_live"] = round(STATE["spent_live"] + cost, 2)
+                fixed += 1
+    return fixed
 
 
 def logline(hist=False, **e):
@@ -451,6 +489,16 @@ def reconcile_ghosts():
                 continue  # can't verify this cycle
             if bal >= 0.01:
                 RECON_NEXT[tid] = now + 600  # healthy position; positions API is behind
+                continue
+            # zero balance in an "open" book proves nothing by itself: gamma and the
+            # CLOB keep reporting a resolved-and-swept market as trading for a while.
+            # The chain's payout vector separates a zero-fill from a swept resolution,
+            # and any fill of ours on record means it was never a ghost.
+            chain = _ctf_payout(tid)
+            if chain in ("won", "lost"):
+                outcome = chain
+            elif _cond_of(tid)[0]:
+                RECON_NEXT[tid] = now + 900  # we filled; payout just not reported yet
                 continue
         name = STATE["names"].get(tid, tid[:16])
         credited = 0.0
@@ -2333,6 +2381,18 @@ def _check():
         assert ("ab" * 32) not in _settings_form(), "private key leaked into the page!"
     finally:
         globals()["PRIVATE_KEY_MEM"] = None
+
+    # ledger audit: a mislabeled ghost gets rewritten and a lost cost re-counted
+    STATE["history"] = [{"side": "GHOST", "kind": "skip", "name": LEDGER_AUDIT_0707[0][0],
+                         "note": "buy never filled on-chain — $3.81 refunded to budget"},
+                        {"side": "GHOST", "kind": "skip", "name": "Some Other Market — Yes",
+                         "note": "buy never filled on-chain — $5.00 refunded to budget"}]
+    STATE["spent_live"] = 1.0
+    assert audit_ledger_0707() == 1
+    assert STATE["spent_live"] == 4.81, "lost cost not re-counted into the odometer"
+    assert "resolved LOST" in STATE["history"][0]["note"]
+    assert "never filled" in STATE["history"][1]["note"]  # untouched: not on the audit list
+    assert audit_ledger_0707() == 0  # idempotent
 
     # headless guard: the flag exists and defaults off; /kill honors it (VPS = systemd-owned)
     assert HEADLESS is False  # desktop default; --headless flips it in __main__
