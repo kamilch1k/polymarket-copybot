@@ -1476,6 +1476,185 @@ def _leader_rows():
     return out or "<tr><td colspan=4 class=dim>leaderboard loading…</td></tr>"
 
 
+SCOUT = {"running": False, "note": "", "rows": [], "at": 0.0}
+SPORTY = (" vs", "O/U", "win on", "end in a draw", "Team to Advance", "(BO", "1st Half", "Spread:")
+
+
+def _net_edge(pnl7, d30, vol7, sell_ratio, friction=0.023):
+    """Copy-EV bounds per $1 mirrored: their edge per $ traded (7d and 30d
+    estimates) minus friction per spread crossing. A flipper pays the exit
+    crossing too; holding to resolution settles free. None = no volume."""
+    if vol7 <= 0:
+        return None
+    e7 = pnl7 / vol7
+    e30 = d30 / max(1.0, vol7 * 30 / 7)
+    crossings = 1 + sell_ratio
+    return (round(min(e7, e30) - crossings * friction, 4),
+            round(max(e7, e30) - crossings * friction, 4))
+
+
+def _curve_screen(vals, min_d30=5000.0):
+    """Stage-1 survival on a 30d equity curve: profitable, mostly-green days,
+    drawdown under 70% of the month's profit. None = screened out."""
+    if len(vals) < 8:
+        return None
+    d30 = vals[-1] - vals[0]
+    deltas = [vals[i] - vals[i - 1] for i in range(1, len(vals))]
+    green = 100 * sum(1 for d in deltas if d > 0) / len(deltas)
+    peak, mdd = -1e18, 0.0
+    for v in vals:
+        peak = max(peak, v)
+        mdd = max(mdd, peak - v)
+    if d30 < min_d30 or green < 45 or mdd > 0.7 * max(d30, 1.0):
+        return None
+    return {"d30": round(d30), "green": round(green), "mdd": round(mdd)}
+
+
+def _scout_deep(c):
+    """Deep pass on one survivor: 7d activity mix -> copyability + net edge."""
+    import statistics
+    addr = c["addr"]
+    try:
+        r = requests.get("https://lb-api.polymarket.com/profit",
+                         params={"window": "7d", "limit": 1, "address": addr}, timeout=15).json()
+        pnl7 = float(r[0]["amount"]) if r else 0.0
+    except Exception:
+        pnl7 = 0.0
+    now = time.time()
+    fills, vol, sells = [], 0.0, 0
+    mkt_cost, clusters = {}, {}
+    for d in range(7):
+        try:
+            rows = requests.get(f"{DATA_API}/activity",
+                                params={"user": addr, "limit": 500,
+                                        "start": int(now - (d + 1) * 86400),
+                                        "end": int(now - d * 86400)}, timeout=15).json()
+        except Exception:
+            continue
+        for a in rows if isinstance(rows, list) else []:
+            if a.get("type") != "TRADE":
+                continue
+            usd = float(a.get("usdcSize", 0))
+            vol += usd
+            side = (a.get("side") or "").upper()
+            sells += side == "SELL"
+            fills.append(a)
+            if side == "BUY":
+                cid = a.get("conditionId") or "?"
+                mkt_cost[cid] = mkt_cost.get(cid, 0.0) + usd
+            k = (a.get("conditionId"), side, a.get("timestamp", 0) // 300)
+            clusters[k] = clusters.get(k, 0.0) + usd
+        time.sleep(0.12)
+    if not fills:
+        return {**c, "verdict": "idle this week", "net": None}
+    sell_ratio = sells / len(fills)
+    od = round(len(clusters) / 7, 1)
+    med = statistics.median(clusters.values()) if clusters else 0.0
+    short = known = 0
+    for cid, cost in sorted(mkt_cost.items(), key=lambda kv: -kv[1])[:8]:
+        sample = next(a for a in fills if a.get("conditionId") == cid)
+        ets = market_end_ts(sample.get("asset"))
+        if ets:
+            known += 1
+            short += (ets - sample.get("timestamp", now)) <= 2 * 86400
+        elif any(kk in (sample.get("title") or "") for kk in SPORTY):
+            known += 1
+            short += 1  # negRisk sports: same-day by construction
+    short_pct = round(100 * short / known) if known else 0
+    net = _net_edge(pnl7, c["d30"], vol, sell_ratio)
+    verdict = ("mm-bot — uncopyable" if od > 300 or (med < 20 and od > 120) else
+               "long-horizon" if short_pct < 55 else
+               "PASS" if net and net[0] > 0 else "edge ≈ 0 after friction")
+    return {**c, "pnl7": round(pnl7), "vol7": round(vol), "od": od,
+            "sell": round(100 * sell_ratio), "short": short_pct, "net": net, "verdict": verdict}
+
+
+def scout_run():
+    """Background scan: leaderboards -> survival screen -> deep metrics.
+    Read-only (~150 public API calls, 2-3 min). Results land in SCOUT."""
+    with LOCK:
+        if SCOUT["running"]:
+            return
+        SCOUT.update(running=True, note="pooling leaderboards…", rows=[])
+    try:
+        pool = {}
+        for w in ("7d", "30d"):
+            try:
+                for r in requests.get("https://lb-api.polymarket.com/profit",
+                                      params={"window": w, "limit": 50}, timeout=15).json():
+                    a = (r.get("proxyWallet") or "").lower()
+                    if a and a not in {t.lower() for t in TARGETS}:
+                        pool.setdefault(a, r.get("name") or r.get("pseudonym") or a[:10])
+            except Exception:
+                pass
+            time.sleep(0.2)
+        surv = []
+        for i, (addr, name) in enumerate(pool.items(), 1):
+            with LOCK:
+                SCOUT["note"] = f"survival screen {i}/{len(pool)}"
+            try:
+                c = requests.get("https://user-pnl-api.polymarket.com/user-pnl",
+                                 params={"user_address": addr, "interval": "1m",
+                                         "fidelity": "1d"}, timeout=15).json()
+                s = _curve_screen([float(p["p"]) for p in sorted(c, key=lambda p: p["t"])])
+                if s:
+                    surv.append(dict(addr=addr, name=name, **s))
+            except Exception:
+                pass
+            time.sleep(0.1)
+        surv.sort(key=lambda r: -r["d30"])
+        surv = surv[:12]  # deep pass is the expensive part — take the strongest
+        done = []
+        for i, cand in enumerate(surv, 1):
+            with LOCK:
+                SCOUT["note"] = f"deep metrics {i}/{len(surv)}: {cand['name'][:18]}"
+            done.append(_scout_deep(cand))
+            with LOCK:
+                SCOUT["rows"] = list(done)
+        with LOCK:
+            SCOUT["note"] = f"done {time.strftime('%H:%M')} — {sum(1 for r in done if r.get('verdict') == 'PASS')} PASS of {len(done)} deep-checked ({len(pool)} pooled)"
+    finally:
+        with LOCK:
+            SCOUT["running"] = False
+            SCOUT["at"] = time.time()
+
+
+def _scout_card():
+    with LOCK:
+        s = {"running": SCOUT["running"], "note": SCOUT["note"], "rows": list(SCOUT["rows"])}
+    cur = {a.lower() for a in TARGETS}
+    btn = ('<form method=post action=/scout style=display:inline>'
+           f'<button class=go {"disabled" if s["running"] else ""}>'
+           f'{"scanning…" if s["running"] else "Scan for copyable traders"}</button></form>')
+    note = f' <span class="tag dim">{html.escape(s["note"])}</span>' if s["note"] else ""
+    vcol = {"PASS": "#4ade80", "mm-bot — uncopyable": "#9ca3af",
+            "long-horizon": "#9ca3af", "idle this week": "#9ca3af"}
+    rows = ""
+    for r in sorted(s["rows"], key=lambda r: -(r["net"][0] if r.get("net") else 9e9), reverse=False):
+        net = f'{r["net"][0]:+.0%} … {r["net"][1]:+.0%}' if r.get("net") else "—"
+        copying = r["addr"].lower() in cur
+        act = ("<span class='tag dim'>copying ✓</span>" if copying else
+               f'<form method=post action=/target style=margin:0>'
+               f'<input type=hidden name=addr value="{r["addr"]}">'
+               f'<button class=copy title="start copying — same as clicking copy on the leaderboard">copy</button></form>')
+        rows += (f'<tr><td>{html.escape(str(r["name"]))[:20]}</td>'
+                 f'<td class=r>${r["d30"]:,}</td><td class=r>${r.get("vol7", 0):,}</td>'
+                 f'<td class=r>{r.get("od", "—")}</td><td class=r>{r.get("sell", "—")}%</td>'
+                 f'<td class=r>{r.get("short", "—")}%</td><td class=r>{net}</td>'
+                 f'<td style="color:{vcol.get(r.get("verdict"), "#fbbf24")}">{r.get("verdict", "")}</td>'
+                 f'<td>{act}</td></tr>')
+    if not rows:
+        rows = ('<tr><td colspan=9 class=dim>'
+                + ("scanning — results appear as each trader finishes…" if s["running"] else
+                   "not run yet — the scan is read-only, takes ~2–3 min, and ranks the current "
+                   "leaderboard by friction-adjusted copy edge (the math in the README)")
+                + "</td></tr>")
+    return (f'<h2>Trader scout — who is worth copying right now</h2><div class=card>{btn}{note}'
+            f'<table><tr><th>trader</th><th class=r>30d pnl</th><th class=r>7d vol</th>'
+            f'<th class=r>ord/d</th><th class=r>sell%</th><th class=r>≤2d%</th>'
+            f'<th class=r>net copy edge</th><th>verdict</th><th></th></tr>{rows}</table></div>')
+
+
 def _vstyle(value, ok):
     """Green border = present and verified real. Red = present but bad."""
     if not value:
@@ -1640,6 +1819,7 @@ def render_dyn():
     <ul class=tips>{stats}</ul>
   </div>
 </div>
+{_scout_card()}
 <h2>Who else to copy (leaderboard — click to switch target)</h2>
 <div class=card><table><tr><th>#</th><th>trader</th><th class=r>pnl</th><th></th></tr>{_leader_rows()}</table></div>
 <h2>Trade history</h2>
@@ -1801,6 +1981,8 @@ class Handler(BaseHTTPRequestHandler):
             k = f.get("k", [""])[0].strip()
             if k:
                 threading.Thread(target=copy_missed, args=(k,), daemon=True).start()
+        elif path == "/scout":  # read-only trader scan; single-flight guarded inside
+            threading.Thread(target=scout_run, daemon=True).start()
         elif path == "/openpm":  # open a Polymarket profile in the system browser
             addr = f.get("addr", [""])[0].strip()
             if valid_addr(addr):
@@ -2130,6 +2312,20 @@ def _check():
     tinted = [i for i, c in enumerate(chunks) if "rgba(74,222,128" in c]
     assert tinted == [0], tinted  # only the in-horizon open BUY; far/ended/sell stay plain
     globals()["MAX_DAYS_OUT"] = _mdo
+
+    # trader-scout math: edge bounds, friction crossings, survival screen, card render
+    lo, hi = _net_edge(pnl7=100_000, d30=150_000, vol7=400_000, sell_ratio=0.5)
+    assert (lo, hi) == (0.053, 0.2155), (lo, hi)   # e30=8.75%, e7=25%, minus 1.5 crossings
+    assert _net_edge(0, 0, 0, 0) is None            # no volume, no verdict
+    assert _curve_screen([0, 5e3, 9e3, 12e3, 15e3, 17e3, 19e3, 20e3])["d30"] == 20000
+    assert _curve_screen([0, 20e3, 1e3, 2e3, 3e3, 4e3, 5e3, 6e3]) is None   # 95% drawdown
+    assert _curve_screen([0, 1e3]) is None                                   # too short
+    SCOUT["rows"] = [{"addr": "0x" + "9" * 40, "name": "TestGuy", "d30": 50000, "green": 60,
+                      "mdd": 100, "pnl7": 9000, "vol7": 80000, "od": 12.0, "sell": 5,
+                      "short": 95, "net": (0.05, 0.2), "verdict": "PASS"}]
+    card = _scout_card()
+    assert "TestGuy" in card and "+5% … +20%" in card and "/target" in card and "PASS" in card
+    SCOUT["rows"] = []
 
     # headless guard: the flag exists and defaults off; /kill honors it (VPS = systemd-owned)
     assert HEADLESS is False  # desktop default; --headless flips it in __main__
