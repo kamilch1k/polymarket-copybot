@@ -890,6 +890,29 @@ def copy_missed(k):
         t = next((x for x in STATE["target_feed"] if key(x) == k), None)
     if t and str(t.get("side", "")).upper() == "BUY":
         handle(dict(t))
+    elif not t:
+        # never fail silently: fast feeds (6 targets) push rows out between render and click
+        logline(kind="skip", side="BUY", note="copy: that row already scrolled out of the feed — nothing replayed")
+
+
+def copy_all_missed():
+    """'Copy all shown' button: replay every displayed, un-held feed BUY through
+    the NORMAL pipeline, one at a time — each copy still passes every gate
+    (no stacking, no chasing, horizon, budget). Fires only on the owner's click."""
+    with LOCK:
+        feed = list(STATE["target_feed"])[:15]
+        taken = {tid for tid, sh in STATE["holdings"].items() if sh > 0}
+        taken |= {p.get("tid") for p in STATE["pending"].values()}
+        taken |= set(INFLIGHT_BUYS)
+    todo, seen = [], set()
+    for t in feed:
+        a = t.get("asset")
+        if str(t.get("side", "")).upper() == "BUY" and a not in taken and a not in seen:
+            seen.add(a)
+            todo.append(t)
+    logline(kind="skip", note=f"copy-all: replaying {len(todo)} shown BUY row(s) through the gates")
+    for t in todo:
+        handle(dict(t))
 
 
 def sell_position(tid):
@@ -1861,7 +1884,9 @@ def render_dyn():
     <table><tr><th>time</th><th>market — outcome</th><th class=r>size</th></tr>{irows}</table>
   </div>
   <div class=card>
-    <h2>Targets — live activity</h2>
+    <h2>Targets — live activity <form method=post action=/copyall style=display:inline
+      onsubmit="return confirm('Replay ALL shown BUY rows through the normal gates (no stacking, no chasing, horizon, budget)?')">
+      <button class=copy title="copy every displayed BUY that is not already held — each one still passes all gates">copy all shown</button></form></h2>
     <table><tr><th>when</th><th>trader</th><th>side</th><th>market — outcome</th><th class=r>size</th><th class=r>px</th><th></th></tr>{_target_rows()}</table>
     <h2>How to copy him best</h2>
     <ul class=tips>{stats}</ul>
@@ -2029,6 +2054,8 @@ class Handler(BaseHTTPRequestHandler):
             k = f.get("k", [""])[0].strip()
             if k:
                 threading.Thread(target=copy_missed, args=(k,), daemon=True).start()
+        elif path == "/copyall":  # feed button: replay ALL shown missed BUYs (each gated)
+            threading.Thread(target=copy_all_missed, daemon=True).start()
         elif path == "/scout":  # read-only trader scan; single-flight guarded inside
             threading.Thread(target=scout_run, daemon=True).start()
         elif path == "/openpm":  # open a Polymarket profile in the system browser
@@ -2339,12 +2366,28 @@ def _check():
     copy_missed("0xh1:tokS:SELL")
     copy_missed("0xh2:tokB:BUY")
     copy_missed("bogus")
+    assert "scrolled out" in STATE["log"][0]["note"]  # a missed key is never silent
     globals()["handle"] = _oh
     assert calls == ["tokB"], calls
     assert "/copymiss" in _target_rows()   # un-held BUY row gets its copy button
     STATE["holdings"]["tokB"] = 5.0
     assert "/copymiss" not in _target_rows()  # held -> button gone (no stacking)
     del STATE["holdings"]["tokB"]
+
+    # copy-all: dedupes sprayed assets, skips held rows and sells, replays the rest
+    calls = []
+    _oh = handle
+    globals()["handle"] = lambda t: calls.append(t["asset"])
+    STATE["holdings"]["tokHeld"] = 5.0
+    STATE["target_feed"] = [
+        {"transactionHash": "0xa", "asset": "tokN1", "side": "BUY", "price": 0.5, "size": 9},
+        {"transactionHash": "0xb", "asset": "tokN1", "side": "BUY", "price": 0.5, "size": 9},
+        {"transactionHash": "0xc", "asset": "tokHeld", "side": "BUY", "price": 0.5, "size": 9},
+        {"transactionHash": "0xd", "asset": "tokN2", "side": "SELL", "price": 0.5, "size": 9}]
+    copy_all_missed()
+    globals()["handle"] = _oh
+    assert calls == ["tokN1"], calls
+    del STATE["holdings"]["tokHeld"]
 
     # green tint marks exactly the rows that would copy: open market inside horizon
     _mdo = MAX_DAYS_OUT
