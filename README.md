@@ -121,6 +121,48 @@ automatically skips those, so only his short-horizon flow is mirrored.
 | several (e.g. 300–500 orders/day, $10 median) | mm-bots | copier pays the spread the bot earns |
 | several | net edge ∈ [−0.1%, +2%] | statistically indistinguishable from zero after friction |
 
+### The execution math — the gates every copy passes
+
+Selection finds edge; execution keeps it. Each mirrored BUY at target price
+$p_T$, target size $q_T$, wallet total $W$:
+
+**Sizing** (flat, bankroll-scaled — a bounded fractional-Kelly stand-in, since
+per-trade $\mu,\sigma$ are unknowable for someone else's signal):
+
+$$\text{notional} = \mathrm{clip}\big(f \cdot q_T\, p_T,\ \$1,\ C\big), \qquad C = \max(\$5,\ 0.10\,W)$$
+
+**No-chase gate** — copy only while the price hasn't outrun the signal
+(caps lag cost by construction; this is why measured drift stays ≤ +1pp):
+
+$$p_{\text{now}} \le p_T\,(1 + s), \qquad s = 2\%$$
+
+**Horizon gate & capital velocity** — copy only markets resolving within
+$H$ ($=2$ days). With per-copy net edge $\mu$ and holding time $\tau$, the
+bankroll growth rate is $\;g \approx \mu \cdot \frac{u}{\tau}\;$ (utilization
+$u$, turnover $1/\tau$): the same 5% edge compounds ~90× faster in a same-day
+market than a six-month future. Short horizon isn't cosmetic — it's the
+compounding engine.
+
+**Budget ratchet** (drawdown self-throttle). The odometer $S$ counts money at
+risk plus unhealed losses:
+
+$$S \leftarrow S + \text{cost(buy)} - \text{cost(settled win)} - \text{proceeds(sell)}, \qquad S \ge \sum_{\text{open}} \text{cost}_i$$
+
+and a buy is allowed only while $S + \text{notional} \le W - R$ (reserve
+$R$). Wins free their stake; **losses stay counted** — so a losing streak
+mechanically shrinks what the bot may deploy next, without anyone touching a
+setting.
+
+**Breakeven check against realized results.** Copies entered at mean price
+$\bar{p} = 0.57$ (median 0.61, n = 55). For binary markets held to
+resolution, the breakeven win rate is
+
+$$\mathrm{WR}_{be} = \bar{p}\,(1 + f) \approx 0.57 \times 1.023 \approx 58.3\%$$
+
+Realized: **62%** over 29 settled copies — a ~+3.7pp margin over breakeven,
+consistent with a small positive transferred edge (and, at n = 29, still
+compatible with luck; the margin is the right sign, not yet proof).
+
 ### Known limitations of the estimator (read before trusting it)
 
 - $\mathrm{PnL}_w/V_w$ mixes realized and mark-to-market profit; a whale
@@ -170,13 +212,49 @@ through the Hetzner API, `setup.sh` bootstraps it (venv, firewall = SSH only,
 UI loopback-bound, systemd service, auto security updates), `push.ps1` ships
 updates.
 
-## Safety model
+## Why it's safe to run — verified claims, not vibes
 
-- Boots watch-only unless fully configured; approve mode queues every copy for a manual ✓
-- SELLs only what the bot itself bought, clamped to the actual on-chain balance
-- Buys capped per-trade and by a hard budget; losses stay counted against it (drawdown self-throttle)
-- The copilot can tune settings but can never place trades or read the key
-- The trading wallet should only ever hold the bankroll — that's the real security boundary
+Every claim below is checkable by grepping the (single) source file, and the
+sensitive ones are enforced by self-tests that the deploy script runs before
+any release.
+
+**The key can't leave your machine.**
+- The private key is used for exactly one thing: locally signing CLOB order
+  structs (EIP-712) inside the official `py-clob-client` flow. It is never
+  transmitted, never logged, never included in the copilot's context.
+- The web UI's key field is **write-only**: the served HTML never echoes the
+  stored key (enforced by a self-test that fails the build if it ever does).
+- Storage is a gitignored local file; this repo's **entire git history is
+  scanned for the key value in all encodings** as part of the release
+  checklist — it has never touched a commit.
+
+**The bot can't move your funds anywhere.**
+- Grep the file: there is no transfer, no withdrawal, no
+  `eth_sendRawTransaction` — the only Polygon RPC calls are read-only
+  `eth_call`s (balances and the Conditional Tokens payout vector). The
+  worst-case blast radius of a bug is *bad trades within the budget caps*,
+  not exfiltrated funds.
+
+**Bounded egress.** The complete list of hosts the bot ever contacts:
+`*.polymarket.com` (data, gamma, lb, user-pnl, CLOB REST + WebSocket) and two
+public Polygon RPCs (`publicnode.com`, `polygon-rpc.com`) for read-only chain
+queries. No telemetry, no analytics, no third parties.
+
+**Bounded blast radius by construction.**
+- HTTP UI binds to `127.0.0.1` only — nothing is exposed to the network
+  (reach it remotely via Tailscale/SSH tunnel, never a public port)
+- boots watch-only unless fully configured; approve mode queues every copy
+  for a manual ✓
+- buys capped per-trade and by the hard budget ratchet above; SELLs only what
+  the bot itself bought, clamped to the actual on-chain balance
+- the Claude copilot tunes settings through a whitelisted action protocol; it
+  cannot place trades and its context snapshot excludes the key
+- one subprocess exists in the whole file: the copilot's `claude -p` call —
+  fixed argv, no shell
+
+**And the boundary that actually matters:** run it on a dedicated wallet that
+only ever holds your bankroll. Software guarantees end where key custody
+begins — size the wallet so the worst case is a shrug.
 
 ## Disclaimer
 
