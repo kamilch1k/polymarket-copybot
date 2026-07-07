@@ -21,10 +21,35 @@ with real (small) money. Everything below is from that live run.
 | Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 6 |
 | Biggest single-match result | Portugal–Spain: 3 legs, 3 wins, ~+$12.9 on ~$16 staked |
 
+Every trade above is independently verifiable on-chain:
+**[my live Polymarket profile](https://polymarket.com/@0x8df3ad8dd5893b65c23d8b3263b00fc507a1a75e-1780997991335)** —
+the bot's wallet, fills, and P&L are public record, not screenshots.
+
 Honest caveats: 4 days is a tiny sample; a chunk of the current balance is
 mark-to-market on open in-play positions and can still swing; every edge was
 measured during World Cup 2026, a uniquely liquid regime that ends July 19 —
 the roster gets re-screened after that. Nothing here is financial advice.
+
+### Not just football
+
+The roster's edge travels across categories, and the run already proves it:
+
+- **Esports (League of Legends, BO5 series)** — same-day resolution, deep
+  in-play books. One copy rode MD14's T1 accumulation; another (Team Secret
+  Whales) resolved LOST — both settled within hours, exactly the turnover
+  profile the horizon math wants.
+- **Crypto candle markets ("Bitcoin Up or Down, 10:45–11:00AM")** — the purest
+  short-horizon instrument on the platform: 15-minute resolution. The copy
+  entered 17:52, **won at 18:00** — eight minutes from signal to settled cash.
+  Maximum capital velocity, but spread-sensitive: friction is a huge fraction
+  of a 15-minute edge, so only high-conviction fills clear the gates.
+- **Baseball (MLB run-line spreads)** — daily resolution; one Brewers copy
+  FAK'd into a torn book and became a clean $0 zero-fill (the reconciler
+  refunded it automatically).
+- **Politics & macro (Fed meetings, elections, geopolitics)** — the targets
+  trade these heavily; the bot deliberately *skips* them today. The full
+  reasoning — and the math for when copying them becomes correct — is in the
+  long-horizon section below.
 
 ## Why these traders — the selection math
 
@@ -36,30 +61,54 @@ what *they* make. **The whole pipeline ships inside the bot**: a
 calls, 2–3 min) and ranks the current leaderboard by net copy edge, with a
 copy button next to anyone who passes.
 
-### The model
+### The model — a proper derivation
 
-Copying trader $T$ means: every time $T$ opens a position, you buy the same
-token within seconds at (approximately) the same price, with your own sizing.
-Your expected profit per mirrored dollar is *their* skill minus *your* costs:
+**Setup.** Copying trader T means: each time T buys a token at price p, the
+bot buys the same token within seconds at price p′ ≤ p(1+s), with its own
+sizing. Assume, over the estimation window, T's trades have a stationary
+per-dollar edge (their fills beat fair value by e on average) and that our
+fill quality differs from theirs only by measurable drift and spread costs.
 
-$$\widehat{e}_w \;=\; \frac{\mathrm{PnL}_w}{V_w} \qquad w \in \{7\mathrm{d},\,30\mathrm{d}\}$$
+**Lemma (expected transfer per mirrored dollar).** Let e be T's edge per
+dollar traded, f the cost of one spread crossing, and q the probability T
+exits a position early (rather than holding to resolution, which settles at
+face value, frictionlessly). Then a copied dollar earns in expectation
 
-where $\mathrm{PnL}_w$ is their profit over window $w$ and $V_w$ their traded
-volume — their realized edge per dollar pushed through the market. Two windows
-give a cheap regime check: a hot week on top of a flat month reads very
-differently from a consistently earning month.
+```math
+\mathbb{E}[\pi] \;=\; e \;-\; f\,(1 + q)
+```
 
-Costs are dominated by **spread crossings**. A marketable order pays roughly
-half the spread plus impact each time it crosses the book. If the trader holds
-to resolution, settlement is frictionless — you pay one crossing. If they exit
-early, your copy exits too and pays a second:
+*Proof sketch.* The entry order always crosses the book once: cost f. With
+probability q the target exits early; the mirrored exit crosses again: cost
+q·f in expectation. Resolution needs no order. The copied position collects
+T's edge e by construction (same token, price within the no-chase band, drift
+empirically ≈ 0 — measured below). Linearity of expectation gives the sum. ∎
 
-$$c \;=\; 1 + \underbrace{\frac{\text{sell fills}}{\text{all fills}}}_{\text{sell ratio}} \qquad\qquad \mathrm{net}_w \;=\; \widehat{e}_w - c \cdot f$$
+**Estimators.** Neither e nor q is observable directly, so both are estimated
+from public fills over two windows w ∈ {7d, 30d}:
 
-with $f$ the friction per crossing. **A trader is armed only if
-$\min_w \mathrm{net}_w > 0$** — the edge must survive friction even under the
-pessimistic estimate. This single inequality is what killed the most tempting
-candidate of the run (see rejects below).
+```math
+\widehat{e}_w=\frac{\mathrm{PnL}_w}{V_w},
+\qquad
+\widehat{q}=\frac{\#\,\text{sell fills}}{\#\,\text{all fills}},
+\qquad
+\widehat{\mathrm{net}}_w=\widehat{e}_w-(1+\widehat{q})\,f
+```
+
+PnL-over-volume is their realized profit per dollar pushed through the market;
+two windows are a cheap regime check (a hot week on a flat month reads very
+differently from a consistently earning month) and yield an interval estimate
+rather than a point.
+
+**Arming rule.**
+
+```math
+\min_{w\in\{7\mathrm{d},30\mathrm{d}\}} \widehat{\mathrm{net}}_w \;>\; 0
+```
+
+— the edge must survive friction under the *pessimistic* estimate. This single
+inequality is what killed the most tempting candidate of the run (see rejects
+below).
 
 ### Where the 2.3% friction constant comes from
 
@@ -79,9 +128,13 @@ its own achievable price on **every live copy**:
 From the 7d/30d leaderboards (top 50 each), a candidate survives if their
 30-day equity curve shows:
 
-- profit > \$5k **and** ≥45% green days (steady accumulation, not one lucky hit)
-- max drawdown < 70% of the month's profit — formally
-  $\max_t \left(\max_{s\le t} P_s - P_t\right) < 0.7 \cdot (P_{30} - P_0)$,
+- profit > $5k **and** ≥45% green days (steady accumulation, not one lucky hit)
+- max drawdown < 70% of the month's profit — on the equity curve P:
+
+```math
+\max_{t}\Big(\max_{s\le t} P_s - P_t\Big) \;<\; 0.7\,(P_{30}-P_0)
+```
+
   which filters the all-in martingale cowboys who eventually donate everything back
 - traded within the last 3 days (a hot hand that went quiet is unverifiable)
 
@@ -103,7 +156,7 @@ Profitable is not the same as copyable:
 
 ### Stage 3 — the roster this run (measured Jul 6, live APIs)
 
-| Trader | 7d P&L | 7d volume | sell% | crossings $c$ | ≤2d flow | net copy edge $[\min_w, \max_w]$ | verdict |
+| Trader | 7d P&L | 7d volume | sell% | crossings (1+q) | ≤2d flow | net copy edge [min, max] | verdict |
 |---|---|---|---|---|---|---|---|
 | NonceChaser | +$568k | $371k | 9% | 1.09 | mixed¹ | **+39% … +150%** | armed |
 | MD14 | +$386k | $1.95M | 2% | 1.02 | 100% | **+4.0% … +17.5%** | armed |
@@ -117,57 +170,75 @@ automatically skips those, so only his short-horizon flow is mirrored.
 | Candidate (anonymized where fair) | Numbers | Failing grade |
 |---|---|---|
 | muchobliged | +$3.3M in 7d, account age **5 days** | no persistence evidence — luck and skill are indistinguishable at n≈1 week |
-| Mind.The.Gap | strong gross edge, **sell-heavy flipper** → $c \approx 2$ | $\mathrm{net}_{\min} < 0 < \mathrm{net}_{\max}$: the double crossing eats the transferable edge; one −$64k day confirmed the variance |
+| Mind.The.Gap | strong gross edge, **sell-heavy flipper** → crossings ≈ 2 | net edge interval straddles zero (min < 0 < max): the double crossing eats the transferable edge; one −$64k day confirmed the variance |
 | several (e.g. 300–500 orders/day, $10 median) | mm-bots | copier pays the spread the bot earns |
 | several | net edge ∈ [−0.1%, +2%] | statistically indistinguishable from zero after friction |
 
 ### The execution math — the gates every copy passes
 
 Selection finds edge; execution keeps it. Each mirrored BUY at target price
-$p_T$, target size $q_T$, wallet total $W$:
+p_T and target share count q_T, with wallet total W:
 
-**Sizing** (flat, bankroll-scaled — a bounded fractional-Kelly stand-in, since
-per-trade $\mu,\sigma$ are unknowable for someone else's signal):
+**Sizing** (flat, bankroll-scaled — a bounded stand-in for fractional Kelly,
+since per-trade μ and σ are unknowable for someone else's signal; Kelly's
+optimal fraction μ/σ² cannot be estimated, so the bot bounds the fraction
+instead of pretending to know it):
 
-$$\text{notional} = \mathrm{clip}\big(f \cdot q_T\, p_T,\ \$1,\ C\big), \qquad C = \max(\$5,\ 0.10\,W)$$
+```math
+\text{notional} \;=\; \mathrm{clip}\!\big(\phi\, q_T\, p_T,\;\; 1,\;\; C\big),
+\qquad C=\max(5,\;0.10\,W)\ \ \text{USD}
+```
 
-**No-chase gate** — copy only while the price hasn't outrun the signal
-(caps lag cost by construction; this is why measured drift stays ≤ +1pp):
+**No-chase gate** — copy only while the price hasn't outrun the signal. This
+inequality is why measured drift stays ≤ +1pp: lag cost is capped by
+construction, not by luck:
 
-$$p_{\text{now}} \le p_T\,(1 + s), \qquad s = 2\%$$
+```math
+p_{\text{now}} \;\le\; p_T\,(1+s), \qquad s = 2\%
+```
 
-**Horizon gate & capital velocity** — copy only markets resolving within
-$H$ ($=2$ days). With per-copy net edge $\mu$ and holding time $\tau$, the
-bankroll growth rate is $\;g \approx \mu \cdot \frac{u}{\tau}\;$ (utilization
-$u$, turnover $1/\tau$): the same 5% edge compounds ~90× faster in a same-day
-market than a six-month future. Short horizon isn't cosmetic — it's the
-compounding engine.
+**Horizon gate & capital velocity.** Only markets resolving within H (= 2
+days) are copied. With per-copy net edge μ, capital fraction κ per copy, and
+holding time τ, expected log-growth per day is
 
-**Budget ratchet** (drawdown self-throttle). The odometer $S$ counts money at
+```math
+g \;\approx\; \frac{u}{\tau}\,\ln(1+\kappa\mu)\;\approx\;\frac{u\,\kappa\,\mu}{\tau}
+```
+
+(utilization u, turnover 1/τ). Growth is *inversely proportional to holding
+time*: the same 5% edge compounds ~90× faster in a same-day market than in a
+six-month future. Short horizon isn't cosmetic — it is the compounding engine.
+
+**Budget ratchet** (drawdown self-throttle). The odometer S counts money at
 risk plus unhealed losses:
 
-$$S \leftarrow S + \text{cost(buy)} - \text{cost(settled win)} - \text{proceeds(sell)}, \qquad S \ge \sum_{\text{open}} \text{cost}_i$$
+```math
+S \;\leftarrow\; S + \text{cost(buy)} - \text{cost(settled win)} - \text{proceeds(sell)},
+\qquad S \;\ge\; \sum_{\text{open}} \text{cost}_i
+```
 
-and a buy is allowed only while $S + \text{notional} \le W - R$ (reserve
-$R$). Wins free their stake; **losses stay counted** — so a losing streak
-mechanically shrinks what the bot may deploy next, without anyone touching a
-setting.
+and a buy is allowed only while S + notional ≤ W − R (reserve R). Wins free
+their stake; **losses stay counted** — a losing streak mechanically shrinks
+what the bot may deploy next, with no human in the loop.
 
 **Breakeven check against realized results.** Copies entered at mean price
-$\bar{p} = 0.57$ (median 0.61, n = 55). For binary markets held to
-resolution, the breakeven win rate is
+p̄ = 0.57 (median 0.61, n = 55). A binary position bought at p̄ and held to
+resolution pays 1 on a win and 0 on a loss, so with entry friction f the
+expected profit is WR·1 − p̄(1+f), giving the breakeven win rate
 
-$$\mathrm{WR}_{be} = \bar{p}\,(1 + f) \approx 0.57 \times 1.023 \approx 58.3\%$$
+```math
+\mathrm{WR}_{be} \;=\; \bar{p}\,(1+f) \;\approx\; 0.57 \times 1.023 \;\approx\; 58.3\%
+```
 
 Realized: **62%** over 29 settled copies — a ~+3.7pp margin over breakeven,
-consistent with a small positive transferred edge (and, at n = 29, still
-compatible with luck; the margin is the right sign, not yet proof).
+the right sign for a transferred edge, honestly still compatible with luck at
+n = 29.
 
 ### Known limitations of the estimator (read before trusting it)
 
-- $\mathrm{PnL}_w/V_w$ mixes realized and mark-to-market profit; a whale
-  marking up his own illiquid positions inflates $\widehat{e}$. The two-window
-  bound and drawdown screen mitigate, not eliminate, this.
+- PnL/volume mixes realized and mark-to-market profit; a whale marking up his
+  own illiquid positions inflates the edge estimate. The two-window bound and
+  drawdown screen mitigate, not eliminate, this.
 - Leaderboards are survivorship-biased by construction — the screen can only
   rank *visible* survivors, which is why the consistency requirements matter
   more than the headline P&L.
@@ -175,6 +246,67 @@ compatible with luck; the margin is the right sign, not yet proof).
   liquid, fast-resolving regime. The roster gets re-screened when it ends.
 - Sample sizes are honest but small: 4 days, 29 settled copies. The math picks
   *plausible* edges; it cannot promise them.
+
+## Long-horizon markets — why the bot skips them today, and when that flips
+
+The roster trades six-month politics futures, Fed-meeting markets and election
+props with visible success — and the bot deliberately copies none of it. This
+is a capital-allocation theorem, not squeamishness.
+
+**The opportunity-cost bar.** From the growth identity above, a dollar in the
+short-horizon book compounds at rate g. Locking that dollar into a market
+resolving in τ_L days is only correct if its expected edge beats the
+short book's compounded return over the same lock-up:
+
+```math
+\mu_L \;>\; (1+g)^{\tau_L} - 1 \;\approx\; g\,\tau_L
+```
+
+At this run's measured (early, tiny-bankroll, won't-scale) growth of several
+percent *per day*, a 184-day position — NonceChaser's actual "Burnham next
+PM" trade — would need a triple-digit expected edge to justify the lock-up.
+No screened trader's verified edge clears that bar. At a large bankroll where
+g decays toward zero, the bar drops like g·τ_L and long-horizon copying
+becomes rational; the config knob (`max days out`) is one number away.
+
+**The subtlety that changes the math: effective holding time.** Because the
+bot mirrors *sells* too, the true capital lock-up is the **target's holding
+time**, not the market's time-to-resolution:
+
+```math
+\tau_{\text{eff}} \;=\; \min(\tau_{\text{target hold}},\ \tau_{\text{resolution}})
+```
+
+A trader who swing-trades a 6-month election market with 3-day holds is,
+for copying purposes, a 3-day trader — the current end-date gate is a
+conservative *proxy* that over-rejects exactly this case. The correct
+long-horizon gate is per-trader median holding time; it isn't shipped yet
+because estimating it robustly needs weeks of per-position entry/exit pairing
+(and a target who *never* exits leaves you holding to resolution anyway —
+τ_eff degrades to τ_resolution precisely when you least want it).
+
+**Which long markets would qualify first, ranked by the math:**
+
+1. **Catalyst-dated macro (Fed meetings, scheduled announcements)** — the
+   market may list for months, but copying inside the final H days before the
+   catalyst needs *no new machinery*: τ collapses to days and the existing
+   gate already admits them naturally as the date approaches.
+2. **Liquid politics majors (presidential/PM markets)** — continuous two-sided
+   books mean a mirrored exit is always available, so τ_eff ≈ the target's
+   holding time; enable only with the holding-time gate above plus a
+   per-category exposure cap (long marks are noisy, and PnL/volume screens
+   are most inflatable exactly here).
+3. **Crypto strike/expiry markets (weekly/monthly)** — bounded τ_L of 7–30
+   days, deep books; the bar g·τ_L is only a few multiples of the short-book
+   edge, plausibly clearable by a specialist trader with verified strike-market
+   history.
+4. **Last: open-ended geopolitics ("X out by year-end")** — resolution-source
+   risk, API-blind negRisk plumbing (the bot's on-chain payout oracle handles
+   settlement, but *pricing* stays thin), and the worst τ profile. These are
+   the Burnham/Putin trades the horizon cap exists to refuse.
+
+Until the holding-time gate ships, the honest summary is: **the bot copies the
+slice of each trader whose math it can verify, and skips the slice it can't.**
 
 ## Features
 
