@@ -7,28 +7,33 @@ Watches one or more traders and mirrors their trades at a fraction of their size
 Built in a few days of pair-programming with Claude, then left running unattended
 with real (small) money. Everything below is from that live run.
 
-## Live results — first 4 days (Jul 3–7, 2026)
+## Live results — first 5 days (Jul 3–7, 2026)
 
 ![cumulative P&L](docs/pnl.svg)
 
 | Metric | Value |
 |---|---|
 | Bankroll at start | $33.11 |
-| Balance at current marks (Jul 7 night, **after a red day**) | **$47.69** — $35.87 cash + $11.82 in open positions (**+44% since start**; intraday marks peaked near $88 during the Argentina–Egypt match before several legs lost) |
-| Cumulative P&L, Polymarket accounting (hourly series, through Jul 7 20:00) | **+$27.88** (peak +$33.74, deepest trough −$1.54) |
-| Settled copies | 29 — **18 won / 11 lost (62%)** |
+| Balance at current marks (Jul 7, 21:00 — **after the first real red day**) | **$46.84** — $35.87 cash + $10.97 in open positions (**+41% since start**; the bot's midpoint marks briefly valued the account near $88 during the Argentina–Egypt corners pump — thin in-play books — before most of the basket died) |
+| Cumulative P&L | **≈ +$13.7 at tonight's CLOB-midpoint marks** ($46.84 balance − $33.11 start). Polymarket's hourly series still reads +$27.9: it marks six unresolved Argentina–Egypt legs near pre-crash prices and converges down as they resolve on-chain — the red segment on the chart is exactly that gap. Series peak +$33.7 (Jul 7 04:00), day-1 trough −$1.5 |
+| Settled copies | 29 — **18 won / 11 lost (62%)**; six Argentina–Egypt legs ($23.02 at cost, marked ≈$11) still await formal resolution and will move this line |
 | Capital returned by wins | $108.76 |
-| Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 6 |
-| Biggest single-match result | Portugal–Spain: 3 legs, 3 wins, ~+$12.9 on ~$16 staked |
+| Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 7 |
+| Best single-match result | Portugal–Spain: 3 legs, 3 wins, ~+$12.9 on ~$16 staked |
+| Worst single match (unresolved) | Argentina–Egypt: 7 legs, ~$24 staked — one exited ≈flat via a mirrored sell, six still open and marked ≈$11 tonight |
 
 Every trade above is independently verifiable on-chain:
 **[my live Polymarket profile](https://polymarket.com/@0x8df3ad8dd5893b65c23d8b3263b00fc507a1a75e-1780997991335)** —
 the bot's wallet, fills, and P&L are public record, not screenshots.
 
-Honest caveats: 4 days is a tiny sample — **four green days, then one red one**
-(Jul 7: the USA–Belgium legs and a 14-cent Egypt longshot died together,
-−$11 from the overnight high; the budget ratchet responded by shrinking the
-deployable cap automatically). Open-position marks still swing; every edge was
+Honest caveats: 5 days is a tiny sample, and the daily P&L is **not** a green
+staircase — by Polymarket's own daily closes it reads **−$1.5, +$18.6, +$3.6,
+−$0.3, then a properly red Jul 7**: the USA–Belgium legs died at dawn, and in
+the evening the Argentina–Egypt basket (including a 14-cent Egypt-to-advance
+longshot) gave back the corners-pump spike — from +$33.7 at 4 a.m. to ≈ +$13.7
+at tonight's marks, a −$20 intraday drawdown with six legs still awaiting
+formal resolution (the budget ratchet responded by shrinking the deployable
+cap automatically). Open-position marks still swing; every edge was
 measured during World Cup 2026, a uniquely liquid regime that ends July 19 —
 the roster gets re-screened after that. This page is updated from the live
 ledger, drawdowns included. Nothing here is financial advice.
@@ -209,7 +214,7 @@ g \;\approx\; \frac{u}{\tau}\,\ln(1+\kappa\mu)\;\approx\;\frac{u\,\kappa\,\mu}{\
 ```
 
 (utilization u, turnover 1/τ). Growth is *inversely proportional to holding
-time*: the same 5% edge compounds ~90× faster in a same-day market than in a
+time*: the same 5% edge compounds ~90× faster in a two-day market than in a
 six-month future. Short horizon isn't cosmetic — it is the compounding engine.
 
 **Budget ratchet** (drawdown self-throttle). The odometer S counts money at
@@ -247,7 +252,7 @@ n = 29.
   more than the headline P&L.
 - All of this was measured during World Cup 2026 (ends Jul 19) — a uniquely
   liquid, fast-resolving regime. The roster gets re-screened when it ends.
-- Sample sizes are honest but small: 4 days, 29 settled copies. The math picks
+- Sample sizes are honest but small: 5 days, 29 settled copies. The math picks
   *plausible* edges; it cannot promise them.
 
 ## Long-horizon markets — why the bot skips them today, and when that flips
@@ -394,5 +399,5 @@ begins — size the wallet so the worst case is a shrug.
 ## Disclaimer
 
 This is a hobby project that trades real money badly or well depending on the
-week. Prediction markets are gambling-adjacent. Past performance of a 4-day
+week. Prediction markets are gambling-adjacent. Past performance of a five-day
 World-Cup-season sample predicts nothing. Run it with money you can lose.
