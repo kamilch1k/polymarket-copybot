@@ -14,13 +14,13 @@ with real (small) money. Everything below is from that live run.
 | Metric | Value |
 |---|---|
 | Bankroll at start | $33.11 |
-| Balance at current marks (Jul 7, 21:00 — **after the first real red day**) | **$46.84** — $35.87 cash + $10.97 in open positions (**+41% since start**; the bot's midpoint marks briefly valued the account near $88 during the Argentina–Egypt corners pump — thin in-play books — before most of the basket died) |
-| Cumulative P&L | **≈ +$13.7 at tonight's CLOB-midpoint marks** ($46.84 balance − $33.11 start). Polymarket's hourly series still reads +$27.9: it marks six unresolved Argentina–Egypt legs near pre-crash prices and converges down as they resolve on-chain — the red segment on the chart is exactly that gap. Series peak +$33.7 (Jul 7 04:00), day-1 trough −$1.5 |
-| Settled copies | 29 — **18 won / 11 lost (62%)**; six Argentina–Egypt legs ($23.02 at cost, marked ≈$11) still await formal resolution and will move this line |
-| Capital returned by wins | $108.76 |
-| Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 7 |
+| Balance at current marks (Jul 7, 22:20 — **after the first real red day**) | **$46.37** — $39.53 cash + $6.84 in open positions (**+40% since start**; the bot's midpoint marks briefly valued the account near $88 during the Argentina–Egypt corners pump — thin in-play books — before most of the basket died) |
+| Cumulative P&L | **≈ +$13.3 at CLOB-midpoint marks** ($46.37 balance − $33.11 start). Polymarket's hourly series reads +$17.1 and is still converging down as tonight's resolutions report on-chain (an hour after the crash it read +$27.9 on stale marks) — the red segment on the chart is that residual gap. Series peak +$36.5 (Jul 7, during the corners pump), day-1 trough −$1.5 |
+| Settled copies | 40 — **24 won / 16 lost (60%)** — audited: every settlement cross-checked against the on-chain payout vector; 8 early entries were re-classified by that audit (see caveats) |
+| Capital returned by wins | $134.11 |
+| Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 2 (an earlier count of 7 was the reconciliation bug described in the caveats — the chain audit reclassified the rest as real fills) |
 | Best single-match result | Portugal–Spain: 3 legs, 3 wins, ~+$12.9 on ~$16 staked |
-| Worst single match (unresolved) | Argentina–Egypt: 7 legs, ~$24 staked — one exited ≈flat via a mirrored sell, six still open and marked ≈$11 tonight |
+| Worst single match | Argentina–Egypt (Jul 7): 7 legs, ~$24 staked, net ≈ **−$12** — four died, two small legs won, one exited ≈flat via a mirrored sell |
 
 Every trade above is independently verifiable on-chain:
 **[my live Polymarket profile](https://polymarket.com/@0x8df3ad8dd5893b65c23d8b3263b00fc507a1a75e-1780997991335)** —
@@ -30,10 +30,14 @@ Honest caveats: 5 days is a tiny sample, and the daily P&L is **not** a green
 staircase — by Polymarket's own daily closes it reads **−$1.5, +$18.6, +$3.6,
 −$0.3, then a properly red Jul 7**: the USA–Belgium legs died at dawn, and in
 the evening the Argentina–Egypt basket (including a 14-cent Egypt-to-advance
-longshot) gave back the corners-pump spike — from +$33.7 at 4 a.m. to ≈ +$13.7
-at tonight's marks, a −$20 intraday drawdown with six legs still awaiting
-formal resolution (the budget ratchet responded by shrinking the deployable
-cap automatically). Open-position marks still swing; every edge was
+longshot) gave back the corners-pump spike — from a +$36.5 intraday peak to
+≈ +$13.3 at the close, with the budget ratchet shrinking the deployable cap
+automatically as the losses landed. Same-day honesty note: a reconciliation
+bug (found, chain-verified and shipped fixed the same evening — commit
+`572d5d4`) had been mislabeling already-swept settlements as "never filled"
+refunds; all eight affected entries were re-verified against the Conditional
+Tokens payout vector on Polygon and corrected, and the numbers above are the
+audited ones. Open-position marks still swing; every edge was
 measured during World Cup 2026, a uniquely liquid regime that ends July 19 —
 the roster gets re-screened after that. This page is updated from the live
 ledger, drawdowns included. Nothing here is financial advice.
@@ -45,15 +49,16 @@ The roster's edge travels across categories, and the run already proves it:
 - **Esports (League of Legends, BO5 series)** — same-day resolution, deep
   in-play books. One copy rode MD14's T1 accumulation; another (Team Secret
   Whales) resolved LOST — both settled within hours, exactly the turnover
-  profile the horizon math wants.
+  profile the horizon math wants. A Dota 2 copy FAK'd into a dust book and
+  became a clean $0 zero-fill, auto-refunded by the reconciler.
 - **Crypto candle markets ("Bitcoin Up or Down, 10:45–11:00AM")** — the purest
   short-horizon instrument on the platform: 15-minute resolution. The copy
   entered 17:52, **won at 18:00** — eight minutes from signal to settled cash.
   Maximum capital velocity, but spread-sensitive: friction is a huge fraction
   of a 15-minute edge, so only high-conviction fills clear the gates.
-- **Baseball (MLB run-line spreads)** — daily resolution; one Brewers copy
-  FAK'd into a torn book and became a clean $0 zero-fill (the reconciler
-  refunded it automatically).
+- **Baseball (MLB run-line spreads)** — daily resolution; a $1 Brewers −1.5
+  copy filled and settled a win (this page briefly called it a zero-fill —
+  the chain audit corrected that).
 - **Politics & macro (Fed meetings, elections, geopolitics)** — the targets
   trade these heavily; the bot deliberately *skips* them today. The full
   reasoning — and the math for when copying them becomes correct — is in the
@@ -238,9 +243,9 @@ expected profit is WR·1 − p̄(1+f), giving the breakeven win rate
 \mathrm{WR}_{be} \;=\; \bar{p}\,(1+f) \;\approx\; 0.57 \times 1.023 \;\approx\; 58.3\%
 ```
 
-Realized: **62%** over 29 settled copies — a ~+3.7pp margin over breakeven,
-the right sign for a transferred edge, honestly still compatible with luck at
-n = 29.
+Realized: **60%** over 40 settled copies — a ~+1.7pp margin over breakeven:
+the right sign for a transferred edge, but thin enough that luck stays firmly
+on the table at n = 40.
 
 ### Known limitations of the estimator (read before trusting it)
 
@@ -252,7 +257,7 @@ n = 29.
   more than the headline P&L.
 - All of this was measured during World Cup 2026 (ends Jul 19) — a uniquely
   liquid, fast-resolving regime. The roster gets re-screened when it ends.
-- Sample sizes are honest but small: 5 days, 29 settled copies. The math picks
+- Sample sizes are honest but small: 5 days, 40 settled copies. The math picks
   *plausible* edges; it cannot promise them.
 
 ## Long-horizon markets — why the bot skips them today, and when that flips
