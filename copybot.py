@@ -1675,7 +1675,7 @@ def _settings_form():
 <form method=post action=/settings class=settings>
   <label>Target wallet(s) — comma-separate for several<input name=target value="{', '.join(TARGETS)}" {_vstyle(TARGETS, True)} placeholder="0x…, 0x… (or click copy on leaderboard traders)"></label>
   <label>Funder wallet (your deposit address)<input name=funder value="{funder_val}" {_vstyle(funder_val, valid_addr(funder_val))} placeholder="0x…"></label>
-  <label>Private key (saved to copybot_config.json on this PC){key_note}<input name=private_key value="{pk_val}" {_vstyle(pk_val, bool(signer))} autocomplete=off placeholder="0x…"></label>
+  <label>Private key (saved to copybot_config.json on this PC){key_note}<input name=private_key value="" {_vstyle(pk_val, bool(signer))} autocomplete=off placeholder="{'saved ✓ — leave blank to keep, paste to replace' if pk_val else '0x…'}"></label>
   <label>Mode (saves the instant you switch)<select name=mode onchange="this.form.submit()">
     <option value=auto {"selected" if MODE == "auto" else ""}>auto — copy instantly</option>
     <option value=approve {"selected" if MODE == "approve" else ""}>approve — I click ✓ per trade</option>
@@ -1873,7 +1873,7 @@ details.cfg summary{{cursor:pointer;font-weight:700}}
               ok: '✓ valid address — press Save', bad: '✗ not a valid 0x address (42 chars)' }},
     funder: {{ test: function(v) {{ return /^0x[a-fA-F0-9]{{40}}$/.test(v.trim()); }},
               ok: '✓ valid address — press Save', bad: '✗ not a valid 0x address (42 chars)' }},
-    private_key: {{ test: function(v) {{ return /^(0x)?[0-9a-fA-F]{{64}}$/.test(v.trim()); }},
+    private_key: {{ test: function(v) {{ return v.trim() === '' || /^(0x)?[0-9a-fA-F]{{64}}$/.test(v.trim()); }},
               ok: '✓ valid key format — press Save to verify + store', bad: '✗ a key is 64 hex chars (66 with 0x)' }}
   }};
   document.querySelectorAll('.settings input').forEach(function(inp) {{
@@ -2326,6 +2326,13 @@ def _check():
     card = _scout_card()
     assert "TestGuy" in card and "+5% … +20%" in card and "/target" in card and "PASS" in card
     SCOUT["rows"] = []
+
+    # the settings form must NEVER echo the stored key back into served HTML
+    globals()["PRIVATE_KEY_MEM"] = "0x" + "ab" * 32
+    try:
+        assert ("ab" * 32) not in _settings_form(), "private key leaked into the page!"
+    finally:
+        globals()["PRIVATE_KEY_MEM"] = None
 
     # headless guard: the flag exists and defaults off; /kill honors it (VPS = systemd-owned)
     assert HEADLESS is False  # desktop default; --headless flips it in __main__
