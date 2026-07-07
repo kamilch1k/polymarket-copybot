@@ -7,13 +7,13 @@ Watches one or more traders and mirrors their trades at a fraction of their size
 Built in a few days of pair-programming with Claude, then left running unattended
 with real (small) money. Everything below is from that live run.
 
-## Live results — first 5 days (Jul 3–7, 2026)
+## Live results — the first 5 days (Jul 3–8, 2026)
 
 | Metric | Value |
 |---|---|
 | Bankroll at start | $33.11 |
-| Balance at current marks (Jul 7, 22:20 — **after the first real red day**) | **$46.37** — $39.53 cash + $6.84 in open positions (**+40% since start**; the bot's midpoint marks briefly valued the account near $88 during the Argentina–Egypt corners pump — thin in-play books — before most of the basket died) |
-| Cumulative P&L | **≈ +$13.3 at CLOB-midpoint marks** ($46.37 balance − $33.11 start); Polymarket's own accounting reads +$17.1 while the latest resolutions finish reporting on-chain |
+| Balance at current marks (Jul 8, 00:20 — after the first real red day) | **$42.95** — $39.53 cash + ≈$3.4 in open positions (**+30% since start**; the bot's midpoint marks briefly valued the account near $88 during the Argentina–Egypt corners pump — thin in-play books — before most of the basket died) |
+| Cumulative P&L | **≈ +$9.8 at CLOB-midpoint marks** ($42.95 balance − $33.11 start), with in-play legs still open; Polymarket's hourly accounting lags live marks |
 | Settled copies | 40 — **24 won / 16 lost (60%)** — audited: every settlement cross-checked against the on-chain payout vector; 8 early entries were re-classified by that audit (see caveats) |
 | Capital returned by wins | $134.11 |
 | Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 2 (an earlier count of 7 was the reconciliation bug described in the caveats — the chain audit reclassified the rest as real fills) |
@@ -35,10 +35,11 @@ bug (found, chain-verified and shipped fixed the same evening — commit
 `572d5d4`) had been mislabeling already-swept settlements as "never filled"
 refunds; all eight affected entries were re-verified against the Conditional
 Tokens payout vector on Polygon and corrected, and the numbers above are the
-audited ones. Open-position marks still swing; every edge was
-measured during World Cup 2026, a uniquely liquid regime that ends July 19 —
-the roster gets re-screened after that. This page is updated from the live
-ledger, drawdowns included. Nothing here is financial advice.
+audited ones. Open-position marks still swing; most edges were measured
+during World Cup 2026, a uniquely liquid regime that ends July 19 — the
+roster gets re-screened after that (the Jul 8 additions include a year-round
+tennis specialist precisely to outlive it). This page is updated from the
+live ledger, drawdowns included. Nothing here is financial advice.
 
 ### Not just football
 
@@ -74,26 +75,45 @@ copy button next to anyone who passes.
 
 ### The model — a proper derivation
 
-**Setup.** Copying trader T means: each time T buys a token at price p, the
-bot buys the same token within seconds at price p′ ≤ p(1+s), with its own
-sizing. Assume, over the estimation window, T's trades have a stationary
-per-dollar edge (their fills beat fair value by e on average) and that our
-fill quality differs from theirs only by measurable drift and spread costs.
+**Setup and assumptions.** Copying trader T means: each time T buys a token
+at price p_T, the bot buys the same token within seconds at price
+p′ ≤ p_T(1+s), with its own sizing. Three assumptions, each labeled by how it
+is checked:
 
-**Lemma (expected transfer per mirrored dollar).** Let e be T's edge per
-dollar traded, f the cost of one spread crossing, and q the probability T
-exits a position early (rather than holding to resolution, which settles at
-face value, frictionlessly). Then a copied dollar earns in expectation
+- **A1 — stationary edge (tested ex post):** over the estimation window T's
+  fills beat fair value by e per dollar on average, and the window's e
+  predicts the copy period's e. Unverifiable in advance — this is precisely
+  what the two-window bound and survival screens hedge, and what the
+  end-to-end transfer table tests after the fact.
+- **A2 — price-taking (true by construction):** our order is far too small to
+  move the book or T's behavior — $1–5 clips against $10⁴–10⁵ books.
+- **A3 — bounded fill-quality gap (enforced and measured):** our entry
+  differs from T's only by a drift δ = (p′ − p_T)/p_T, hard-capped at
+  s = 2% by the no-chase gate and recorded on every live copy.
+
+**Lemma (expected transfer per mirrored dollar).** With e as above, f the
+cost of one spread crossing, q the probability T exits early (holding to
+resolution settles at face value, frictionlessly), and δ the entry drift:
 
 ```math
-\mathbb{E}[\pi] \;=\; e \;-\; f\,(1 + q)
+\mathbb{E}[\pi] \;=\; e \;-\; f\,(1+q) \;-\; \mathbb{E}[\delta],
+\qquad \mathbb{E}[\delta] \;\le\; s
 ```
 
-*Proof sketch.* The entry order always crosses the book once: cost f. With
-probability q the target exits early; the mirrored exit crosses again: cost
-q·f in expectation. Resolution needs no order. The copied position collects
-T's edge e by construction (same token, price within the no-chase band, drift
-empirically ≈ 0 — measured below). Linearity of expectation gives the sum. ∎
+*Proof.* Write the copy's per-dollar return as T's return minus everything
+about our execution that differs from his. By A2 the outcome distribution of
+the position itself is unchanged, so the copy collects e by construction
+(same token, same side). The execution differences decompose disjointly: the
+entry always crosses the book once (−f); with probability q the target exits
+early and the mirrored exit crosses again (−qf in expectation, by linearity);
+entering at p′ instead of p_T costs the premium δ, bounded by s under A3.
+Resolution itself needs no order. Summing the disjoint costs gives the
+claim. ∎
+
+Measured over 55 live copies, E[δ] ≈ −0.35pp (median −0.5pp) — *negative*:
+the bot on average fills slightly **better** than the target, because the
+no-chase gate only admits copies whose price hasn't already run. Dropping
+the δ term, as the arming rule below does, is therefore conservative.
 
 **Estimators.** Neither e nor q is observable directly, so both are estimated
 from public fills over two windows w ∈ {7d, 30d}:
@@ -120,6 +140,19 @@ rather than a point.
 — the edge must survive friction under the *pessimistic* estimate. This single
 inequality is what killed the most tempting candidate of the run (see rejects
 below).
+
+Why so strict? Because a leaderboard is an extreme-value machine: screen K
+candidates whose measured edges carry estimation noise σ_ε and the largest
+*pure-noise* estimate you will see grows like
+
+```math
+\mathbb{E}\Big[\max_{k\le K}\varepsilon_k\Big] \;\approx\; \sigma_\varepsilon\sqrt{2\ln K}
+```
+
+— at K ≈ 100 that is ≈ 3σ of pure flattery before any skill is proven (the
+winner's curse). One hot window cannot honestly clear that hurdle;
+consistency across independent windows and a long record can. This is why
+the pipeline weighs record depth as heavily as the point estimate.
 
 ### Where the 2.3% friction constant comes from
 
@@ -194,22 +227,38 @@ Profitable is not the same as copyable:
 - **Account age**: a 5-day-old account with a +\$3.3M week is indistinguishable
   from luck (or wash trading). No record depth, no arm.
 
-### Stage 3 — the roster this run (measured Jul 6, live APIs)
+### Stage 3 — the roster (re-measured Jul 7–8, live APIs)
 
-| Trader | 7d P&L | 7d volume | sell% | crossings (1+q) | ≤2d flow | net copy edge [min, max] | verdict |
+| Trader | copying since | 30d P&L | 7d volume | sell% | ≤2d flow | net edge [min, max] | status |
 |---|---|---|---|---|---|---|---|
-| NonceChaser | +$568k | $371k | 9% | 1.09 | mixed¹ | **+39% … +150%** | armed |
-| MD14 | +$386k | $1.95M | 2% | 1.02 | 100% | **+4.0% … +17.5%** | armed |
-| RISK-IS-NEVER-OK | +$553k | $719k | 1% | 1.01 | 100% | **+17% … +75%** | armed |
+| RISK-IS-NEVER-OK | Jul 3 | +$863k | $1.14M | 1% | 100% | **+15% … +25%** | armed — the run's engine (+$22 realized for us) |
+| cnyek | Jul 8 | +$1.34M | $2.24M | 3% | 88% | **+12% … +17%** | armed — 2-month record, ~11 deliberate ~$46 clips/day |
+| Eztennis | Jul 8 | +$3.08M | $6.32M | 6% | 88% | **+9% … +40%** | armed — 6-month record, **94% tennis**: the edge that outlives Jul 19 |
+| 0x3DFb… | Jul 8 | +$1.92M | $3.45M | 0% | 100% | **+11% … +33%** | armed — 23-month account, deepest record on the board |
+| MD14 | Jul 3 | +$208k | $3.02M | 2% | 100% | **−6.8% … −0.7%** | ❗ fails the arming rule this week (−$133k 7d); kept by owner's decision, under review |
+| NonceChaser | Jul 3 | +$652k | $198k | 12% | 6% | −4.5% … +74% | passenger — politics pivot: the horizon cap skips ~94% of his flow |
 
-¹ NonceChaser pivoted into 6-month politics futures mid-run; the horizon cap
-automatically skips those, so only his short-horizon flow is mirrored.
+**Why those three additions — the checks past the leaderboard.** Every Jul 8
+add had to clear two screens the headline number can't fake:
+
+1. **Fill anatomy.** Median clip and raw fill cadence unmask fragmentation.
+   The scan's top point-estimate, "RJW1" (+34…69% on paper), collapsed here:
+   his flow prints as **$4-median fills at ~860/day** — a signal that arrives
+   as unfollowable dust, where a FAK copier gets zero-fills and chase costs
+   instead of edge. cnyek is the anti-case: ~11 fills/day at $46 median —
+   every signal is deliberate, mirrorable conviction.
+2. **Record depth**, per the winner's-curse bound above: 2 months (cnyek),
+   6 months (Eztennis), 23 months (0x3DFb…) of survivable history versus the
+   4-week wonders the extreme-value math says to distrust. Eztennis adds
+   regime insurance on top — tennis resolves same-day, year-round, so the
+   roster no longer dies with the World Cup.
 
 **Rejected, same math:**
 
 | Candidate (anonymized where fair) | Numbers | Failing grade |
 |---|---|---|
-| muchobliged | +$3.3M in 7d, account age **5 days** | no persistence evidence — luck and skill are indistinguishable at n≈1 week |
+| RJW1 | net edge **+34% … +69%** on paper | fills fragment to a $4 median at ~860 prints/day — capture ≈ 0 for a FAK copier (see fill anatomy above) |
+| muchobliged | +$4.2M lifetime, account now **4 weeks** old | still the shallowest record on the board, 500 fills/hour in-play style — re-screen after Jul 19 |
 | Mind.The.Gap | strong gross edge, **sell-heavy flipper** → crossings ≈ 2 | net edge interval straddles zero (min < 0 < max): the double crossing eats the transferable edge; one −$64k day confirmed the variance |
 | several (e.g. 300–500 orders/day, $10 median) | mm-bots | copier pays the spread the bot earns |
 | several | net edge ∈ [−0.1%, +2%] | statistically indistinguishable from zero after friction |
@@ -261,6 +310,22 @@ and a buy is allowed only while S + notional ≤ W − R (reserve R). Wins free
 their stake; **losses stay counted** — a losing streak mechanically shrinks
 what the bot may deploy next, with no human in the loop.
 
+**Correlation — the measured hole in the gate set.** Every gate above is
+per-*market*; nothing yet limits per-*event* stacking, and in-play legs on
+the same match are strongly positively correlated. Variance adds by
+covariance:
+
+```math
+\sigma^2_{\text{match}} \;=\; \sum_i \sigma_i^2 + \sum_{i\neq j}\rho_{ij}\,\sigma_i\sigma_j
+\;\xrightarrow{\ \rho\to 1\ }\; \Big(\sum_i \sigma_i\Big)^2
+```
+
+so m fully-correlated legs behave like **one bet of m-fold size** — the √m of
+apparent diversification is fictitious. The Argentina–Egypt night measured
+this live: seven legs, ~$24 at risk, −$16 gross in a single game — 36% of the
+run's entire loss column. The fix is a per-match exposure cap (the next gate
+planned), which attacks ρ directly instead of anyone's edge.
+
 **Breakeven check against realized results.** Copies entered at mean price
 p̄ = 0.57 (median 0.61, n = 55). A binary position bought at p̄ and held to
 resolution pays 1 on a win and 0 on a loss, so with entry friction f the
@@ -272,7 +337,17 @@ expected profit is WR·1 − p̄(1+f), giving the breakeven win rate
 
 Realized: **60%** over 40 settled copies — a ~+1.7pp margin over breakeven:
 the right sign for a transferred edge, but thin enough that luck stays firmly
-on the table at n = 40.
+on the table at n = 40. Making that honesty exact, a one-sided binomial test
+gives
+
+```math
+P\big(X \ge 24 \,\big|\, n=40,\ p=0.583\big) \;\approx\; 0.48
+```
+
+— the win count alone cannot yet distinguish this bot from a breakeven coin.
+The evidence that the machine works lives in the per-dollar transfer table
+above (sign **and** magnitude matched, in both directions), not in the raw
+win rate; n has to grow before the win rate testifies either way.
 
 ### Known limitations of the estimator (read before trusting it)
 
