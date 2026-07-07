@@ -14,7 +14,7 @@ with real (small) money. Everything below is from that live run.
 | Metric | Value |
 |---|---|
 | Bankroll at start | $33.11 |
-| Balance at current marks (Jul 7 evening) | **$87.94** — $35.87 cash + $52.06 in open positions |
+| Balance at current marks (Jul 7 night, **after a red day**) | **$47.69** — $35.87 cash + $11.82 in open positions (**+44% since start**; intraday marks peaked near $88 during the Argentina–Egypt match before several legs lost) |
 | Cumulative P&L, Polymarket accounting (hourly series, through Jul 7 20:00) | **+$27.88** (peak +$33.74, deepest trough −$1.54) |
 | Settled copies | 29 — **18 won / 11 lost (62%)** |
 | Capital returned by wins | $108.76 |
@@ -25,10 +25,13 @@ Every trade above is independently verifiable on-chain:
 **[my live Polymarket profile](https://polymarket.com/@0x8df3ad8dd5893b65c23d8b3263b00fc507a1a75e-1780997991335)** —
 the bot's wallet, fills, and P&L are public record, not screenshots.
 
-Honest caveats: 4 days is a tiny sample; a chunk of the current balance is
-mark-to-market on open in-play positions and can still swing; every edge was
+Honest caveats: 4 days is a tiny sample — **four green days, then one red one**
+(Jul 7: the USA–Belgium legs and a 14-cent Egypt longshot died together,
+−$11 from the overnight high; the budget ratchet responded by shrinking the
+deployable cap automatically). Open-position marks still swing; every edge was
 measured during World Cup 2026, a uniquely liquid regime that ends July 19 —
-the roster gets re-screened after that. Nothing here is financial advice.
+the roster gets re-screened after that. This page is updated from the live
+ledger, drawdowns included. Nothing here is financial advice.
 
 ### Not just football
 
