@@ -9,13 +9,11 @@ with real (small) money. Everything below is from that live run.
 
 ## Live results — first 5 days (Jul 3–7, 2026)
 
-![cumulative P&L](docs/pnl.svg)
-
 | Metric | Value |
 |---|---|
 | Bankroll at start | $33.11 |
 | Balance at current marks (Jul 7, 22:20 — **after the first real red day**) | **$46.37** — $39.53 cash + $6.84 in open positions (**+40% since start**; the bot's midpoint marks briefly valued the account near $88 during the Argentina–Egypt corners pump — thin in-play books — before most of the basket died) |
-| Cumulative P&L | **≈ +$13.3 at CLOB-midpoint marks** ($46.37 balance − $33.11 start). Polymarket's hourly series reads +$17.1 and is still converging down as tonight's resolutions report on-chain (an hour after the crash it read +$27.9 on stale marks) — the red segment on the chart is that residual gap. Series peak +$36.5 (Jul 7, during the corners pump), day-1 trough −$1.5 |
+| Cumulative P&L | **≈ +$13.3 at CLOB-midpoint marks** ($46.37 balance − $33.11 start); Polymarket's own accounting reads +$17.1 while the latest resolutions finish reporting on-chain |
 | Settled copies | 40 — **24 won / 16 lost (60%)** — audited: every settlement cross-checked against the on-chain payout vector; 8 early entries were re-classified by that audit (see caveats) |
 | Capital returned by wins | $134.11 |
 | Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 2 (an earlier count of 7 was the reconciliation bug described in the caveats — the chain audit reclassified the rest as real fills) |
@@ -135,6 +133,35 @@ its own achievable price on **every live copy**:
 > *better* than the target), worst case +1.0pp — because the no-chase gate
 > refuses any copy where the price already ran more than 2% past the target's
 > fill. Lag risk is capped by construction; the spread is the real cost.
+
+### Does the edge actually transfer? Measured end-to-end
+
+The whole model stands or falls on one question: does a copied dollar earn
+what the lemma says it should? Five days in, it can be checked directly —
+realized profit per staked dollar on our fills, against the model's
+prediction from the target's own numbers:
+
+```math
+\text{realized transfer} \;=\; \frac{\sum_{\text{copies}} \pi}{\sum_{\text{copies}} \text{staked}}
+\qquad\text{vs. predicted}\qquad
+\widehat{e}_{7d} - (1+\widehat{q})\,f
+```
+
+| target (that week) | their ê₇d | predicted net copy edge | our realized per staked $ |
+|---|---|---|---|
+| RISK-IS-NEVER-OK (+$310k on $1.14M) | +27.3% | ≈ +25% | **≈ +28%** (19 copies) |
+| MD14 (−$133k on $3.0M) | −4.4% | ≈ −6.7% | **≈ −6.4%** (11 copies) |
+
+The transfer tracks in **both directions** — sign and rough magnitude. Copying
+a trader's winning week captured essentially his full per-dollar edge (the
+no-chase gate means we sometimes fill *better* than him); copying a trader's
+losing week faithfully delivered the loss the model predicted. The mechanism
+is sound; what it cannot do is make a $46 bankroll feel like his: at 19 copies
+per trader-week, one correlated in-play basket (seven legs on a single match)
+swings a fifth of the bankroll at once. That's a variance problem, not an
+edge problem — and it's the argument for a per-match exposure cap, the next
+gate on the list. Sample sizes are tiny; treat the decimals as illustration,
+the signs as evidence.
 
 ### Stage 1 — survival screens
 
