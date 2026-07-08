@@ -298,11 +298,30 @@ def logline(hist=False, **e):
 
 
 # ---- polymarket api ---------------------------------------------------------
-def fetch_trades(user):
+def fetch_trades(user, limit=100, offset=0):
     r = requests.get(f"{DATA_API}/activity",
-                     params={"user": user, "type": "TRADE", "limit": 100}, timeout=15)
+                     params={"user": user, "type": "TRADE", "limit": limit, "offset": offset}, timeout=15)
     r.raise_for_status()
     return r.json()
+
+
+def fetch_trades_backfilled(user, seen, page=100, cap=600):
+    """Newest fills, paged backward until we reach one we've already seen — so a
+    burst bigger than a single page can't silently outrun the poll (the 100-limit
+    gap that dropped 2 of a 485-trade LoL surge). Caps the walk so a brand-new
+    target with no seen history doesn't page forever."""
+    out, offset = [], 0
+    while offset < cap:
+        batch = fetch_trades(user, limit=page, offset=offset)
+        if not isinstance(batch, list) or not batch:
+            break
+        out += batch
+        if any(key(t) in seen for t in batch):  # reached known ground — nothing older is fresh
+            break
+        if len(batch) < page:
+            break
+        offset += page
+    return out
 
 
 def fetch_leaders():
@@ -1267,7 +1286,13 @@ def bot_loop():
         merged = []
         for target in list(TARGETS):
             try:
-                trades = fetch_trades(target)
+                with LOCK:
+                    seen_snap = set(STATE["seen"])
+                    baselined = target in STATE["baselined"]
+                # first sight: one page is enough (we only baseline it, never copy).
+                # steady state: page back to known ground so bursts can't slip through.
+                trades = fetch_trades(target) if not baselined \
+                    else fetch_trades_backfilled(target, seen_snap)
                 with LOCK:
                     STATE["error"] = ""
                     STATE["last_poll"] = time.time()
@@ -2373,6 +2398,18 @@ def _check():
     STATE["holdings"]["tokB"] = 5.0
     assert "/copymiss" not in _target_rows()  # held -> button gone (no stacking)
     del STATE["holdings"]["tokB"]
+
+    # fetch_trades_backfilled: pages back until it reaches a seen trade, so a burst
+    # bigger than one page can't slip past (the LoL-surge gap). Stub the pager to
+    # yield a full, all-distinct page for every offset (an unbounded burst).
+    _oft = fetch_trades
+    globals()["fetch_trades"] = lambda u, limit=100, offset=0: \
+        [{"transactionHash": f"0x{offset + i}", "asset": "a", "side": "BUY"} for i in range(limit)]
+    got = fetch_trades_backfilled("u", {"0x150:a:BUY"}, page=100, cap=600)  # seen sits in page 2
+    assert len(got) == 200 and any(key(t) == "0x150:a:BUY" for t in got)  # walked past page 1, then stopped
+    # nothing ever seen (fresh target): the cap bounds the walk, no infinite paging
+    assert len(fetch_trades_backfilled("u", set(), page=100, cap=300)) == 300
+    globals()["fetch_trades"] = _oft
 
     # copy-all: dedupes sprayed assets, skips held rows and sells, replays the rest
     calls = []
