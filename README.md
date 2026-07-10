@@ -7,15 +7,15 @@ Watches one or more traders and mirrors their trades at a fraction of their size
 Built in a few days of pair-programming with Claude, then left running unattended
 with real (small) money. Everything below is from that live run.
 
-## Live results — the first 5 days (Jul 3–8, 2026)
+## Live results — the first week (Jul 3–10, 2026)
 
 | Metric | Value |
 |---|---|
 | Bankroll at start | $33.11 |
-| Balance at current marks (Jul 8, 00:20 — after the first real red day) | **$42.95** — $39.53 cash + ≈$3.4 in open positions (**+30% since start**; the bot's midpoint marks briefly valued the account near $88 during the Argentina–Egypt corners pump — thin in-play books — before most of the basket died) |
-| Cumulative P&L | **≈ +$9.8 at CLOB-midpoint marks** ($42.95 balance − $33.11 start), with in-play legs still open; Polymarket's hourly accounting lags live marks |
-| Settled copies | 40 — **24 won / 16 lost (60%)** — audited: every settlement cross-checked against the on-chain payout vector; 8 early entries were re-classified by that audit (see caveats) |
-| Capital returned by wins | $134.11 |
+| Balance at current marks (Jul 10, 23:00) | **$50.83** — $39.47 cash + $11.36 in open positions (**+53% since start**, including two genuinely red days mid-week; the intraday marks once touched ≈$88 on thin in-play books before the Argentina–Egypt basket died) |
+| Cumulative P&L | **≈ +$17.7 at CLOB-midpoint marks** ($50.83 balance − $33.11 start); Polymarket's hourly accounting reads +$13.9 — it marks open positions at exchange prices and lags midpoints |
+| Settled copies | 44 — **26 won / 18 lost (59%)** — audited: every settlement cross-checked against the on-chain payout vector; 8 early entries were re-classified by that audit (see caveats) |
+| Capital returned by wins | $135.98 |
 | Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 2 (an earlier count of 7 was the reconciliation bug described in the caveats — the chain audit reclassified the rest as real fills) |
 | Best single-match result | Portugal–Spain: 3 legs, 3 wins, ~+$12.9 on ~$16 staked |
 | Worst single match | Argentina–Egypt (Jul 7): 7 legs, ~$24 staked, net ≈ **−$12** — four died, two small legs won, one exited ≈flat via a mirrored sell |
@@ -24,18 +24,20 @@ Every trade above is independently verifiable on-chain:
 **[my live Polymarket profile](https://polymarket.com/@0x8df3ad8dd5893b65c23d8b3263b00fc507a1a75e-1780997991335)** —
 the bot's wallet, fills, and P&L are public record, not screenshots.
 
-Honest caveats: 5 days is a tiny sample, and the daily P&L is **not** a green
-staircase — by Polymarket's own daily closes it reads **−$1.5, +$18.6, +$3.6,
-−$0.3, then a properly red Jul 7**: the USA–Belgium legs died at dawn, and in
-the evening the Argentina–Egypt basket (including a 14-cent Egypt-to-advance
-longshot) gave back the corners-pump spike — from a +$36.5 intraday peak to
-≈ +$13.3 at the close, with the budget ratchet shrinking the deployable cap
-automatically as the losses landed. Same-day honesty note: a reconciliation
-bug (found, chain-verified and shipped fixed the same evening — commit
-`572d5d4`) had been mislabeling already-swept settlements as "never filled"
-refunds; all eight affected entries were re-verified against the Conditional
-Tokens payout vector on Polygon and corrected, and the numbers above are the
-audited ones. Open-position marks still swing; most edges were measured
+Honest caveats: a week is a tiny sample, and the daily P&L is **not** a green
+staircase — Polymarket's daily closes read **−$1.5, +$18.6, +$3.6, −$0.3,
+−$4.9, −$4.8, $0.0, +$3.2**. The two red days are the Argentina–Egypt basket
+(seven correlated in-play legs on one match — the case study behind the
+correlation math below) and its aftermath; the flat day is downtime, not
+discipline: a budget-odometer freeze and a transient dependency failure each
+parked the bot for hours (both root-caused and fixed in commits `5dd06de` and
+`2987332` — this page doesn't pretend ops is free). Honesty note on the
+ledger itself: a reconciliation bug (found, chain-verified and shipped fixed
+the same evening — commit `572d5d4`) had been mislabeling already-swept
+settlements as "never filled" refunds; all eight affected entries were
+re-verified against the Conditional Tokens payout vector on Polygon and
+corrected, and the numbers above are the audited ones. Open-position marks
+still swing; most edges were measured
 during World Cup 2026, a uniquely liquid regime that ends July 19 — the
 roster gets re-screened after that (the Jul 8 additions include a year-round
 tennis specialist precisely to outlive it). This page is updated from the
@@ -170,7 +172,7 @@ its own achievable price on **every live copy**:
 ### Does the edge actually transfer? Measured end-to-end
 
 The whole model stands or falls on one question: does a copied dollar earn
-what the lemma says it should? Five days in, it can be checked directly —
+what the lemma says it should? Measured mid-run (Jul 7), it checks directly —
 realized profit per staked dollar on our fills, against the model's
 prediction from the target's own numbers:
 
@@ -335,13 +337,13 @@ expected profit is WR·1 − p̄(1+f), giving the breakeven win rate
 \mathrm{WR}_{be} \;=\; \bar{p}\,(1+f) \;\approx\; 0.57 \times 1.023 \;\approx\; 58.3\%
 ```
 
-Realized: **60%** over 40 settled copies — a ~+1.7pp margin over breakeven:
+Realized: **59%** over 44 settled copies — a ~+0.8pp margin over breakeven:
 the right sign for a transferred edge, but thin enough that luck stays firmly
-on the table at n = 40. Making that honesty exact, a one-sided binomial test
+on the table at n = 44. Making that honesty exact, a one-sided binomial test
 gives
 
 ```math
-P\big(X \ge 24 \,\big|\, n=40,\ p=0.583\big) \;\approx\; 0.48
+P\big(X \ge 26 \,\big|\, n=44,\ p=0.583\big) \;\approx\; 0.52
 ```
 
 — the win count alone cannot yet distinguish this bot from a breakeven coin.
@@ -359,7 +361,7 @@ win rate; n has to grow before the win rate testifies either way.
   more than the headline P&L.
 - All of this was measured during World Cup 2026 (ends Jul 19) — a uniquely
   liquid, fast-resolving regime. The roster gets re-screened when it ends.
-- Sample sizes are honest but small: 5 days, 40 settled copies. The math picks
+- Sample sizes are honest but small: one week, 44 settled copies. The math picks
   *plausible* edges; it cannot promise them.
 
 ## Long-horizon markets — why the bot skips them today, and when that flips
@@ -506,5 +508,5 @@ begins — size the wallet so the worst case is a shrug.
 ## Disclaimer
 
 This is a hobby project that trades real money badly or well depending on the
-week. Prediction markets are gambling-adjacent. Past performance of a five-day
+week. Prediction markets are gambling-adjacent. Past performance of a week-long
 World-Cup-season sample predicts nothing. Run it with money you can lose.
