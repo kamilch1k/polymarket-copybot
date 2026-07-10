@@ -540,6 +540,102 @@ because estimating it robustly needs weeks of per-position entry/exit pairing
 Until the holding-time gate ships, the honest summary is: **the bot copies the
 slice of each trader whose math it can verify, and skips the slice it can't.**
 
+## After July 19 — the long-run math of copying proven winners
+
+The World Cup regime dies on July 19 and most of this page's measurements die
+with it. What does *not* die is the underlying question, so here is its math,
+football-free: **if someone has been successfully trading for a long time —
+for whatever reason — how much of their success can a copier actually
+inherit?**
+
+### Skill is inherited; luck is not
+
+An observed track record is skill plus noise:
+
+```math
+\hat e \;=\; \theta + \varepsilon,
+\qquad \mathrm{SE}(\hat e) = \frac{\sigma_{\text{trade}}}{\sqrt{T}} \approx \frac{0.87}{\sqrt{T}}
+```
+
+(σ_trade ≈ 0.87 per staked dollar is this page's measured per-trade
+volatility; T is the number of settled markets in the record). Copying
+transfers **θ only** — the luck term ε happened to *their* past, not your
+future. The expected inheritance is the Bayesian shrinkage of the headline:
+
+```math
+\mathbb{E}\big[\theta \mid \hat e\,\big] \;=\; \lambda\,\hat e,
+\qquad
+\lambda \;=\; \frac{\sigma_\theta^2}{\sigma_\theta^2 + \sigma_{\text{trade}}^2/T}
+```
+
+where σ_θ is how much true skill varies across traders — a few percent per
+staked dollar at most, since prediction markets are near-zero-sum and the
+skilled are paid by biased recreational flow (the favorite–longshot bias),
+not by magic. Take σ_θ = 3% as the conservative prior. Then a **+15%
+headline edge** is worth, to a copier, as a function of record depth:
+
+| record behind the headline | T (settled markets) | SE(ê) | λ | expected inherited edge | net after ~3% off-season friction |
+|---|---|---|---|---|---|
+| one hot week | ~150 | 7.1% | **0.15** | +2.3% | **−0.7% — noise, uncopyable** |
+| 3 months | ~700 | 3.3% | 0.45 | +6.8% | +3.8% |
+| 1 year | ~2,500 | 1.7% | 0.75 | +11.2% | +8.2% |
+| 2 years | ~5,000 | 1.2% | **0.86** | +12.8% | **+9.8% — mostly real** |
+
+(A more generous prior σ_θ = 5% lifts the week-long λ only to 0.33 — still
+under half.) This one table is the entire long-term thesis: **a week-long
+star transfers ~15% of what you see; a two-year veteran transfers ~86%.** It
+is also, retroactively, the formal justification for this run's roster calls
+— the 23-month account armed, the 4-week wonder rejected — and for why the
+scout weighs record depth as heavily as the point estimate.
+
+### Edges decay; screening cadence must beat the half-life
+
+Skill is not a constant: informational edges erode as markets adapt (and as
+copiers crowd them). With half-life h, an estimate that is Δt old is worth
+
+```math
+\mathbb{E}[\theta_{t+\Delta t}] \;=\; \lambda\,\hat e \cdot 2^{-\Delta t / h}
+```
+
+A monthly re-screen keeps 71% / 89% / 94% of the fresh edge for half-lives of
+2 / 6 / 12 months — so even under fast decay, cheap periodic re-screening
+(the in-bot scout is one click) preserves most of what shrinkage says is
+real. The strategy's maintenance cost is a scan per month, not a rewrite.
+
+### Why the edge should persist at all — and why it stays small
+
+The efficient-markets objection ("if this works it gets arbitraged") answers
+itself at this scale: the inheritable edge lives in **$1–7 clips** on books
+too shallow to interest anyone with payroll. Crowding is self-limiting by
+construction — if copiers mass onto one signal, the price runs and the
+no-chase gate converts the crowd's losses into our *zero-fills* (measured:
+that is exactly what dust-book ghosts are). The same capacity ceiling that
+caps the profit protects the edge. The equilibrium is a persistent,
+small-capital, high-variance niche — permanently below institutional
+attention, permanently above zero in expectation *if and only if the record
+depth math above is respected*.
+
+### What a football-free year plausibly looks like
+
+Off-season the copyable universe is tennis (year-round, same-day), esports
+(daily), crypto candle/strike markets (24/7), baseball and US sports in
+rotation, and — once the holding-time gate ships — the liquid politics
+majors. Flow drops (≈3 settled copies/day vs 6.3 during the Cup) and thinner
+books push friction toward ~3%. Running the same distributional machinery as
+above at Kelly sizing:
+
+| true inherited edge per copy | Kelly κ\* | median month | P(green month) |
+|---|---|---|---|
+| +2% (thin — shallow records passing the screen) | 2.7% | +2.4% | 53% |
+| +5% (solid — the 3-month-record tier) | 6.7% | +16.1% | 58% |
+| +10% (deep-record specialist, post-shrinkage) | 13.3% | +82.0% | 66% |
+
+The honest long-term claim is therefore narrow: **copying is a real,
+persistent, mathematically defensible edge — of pocket-money size, casino
+variance, and a strict precondition: only ever inherit from records deep
+enough that λ is close to 1.** Everything else on a leaderboard is renting
+someone's luck.
+
 ## Features
 
 - **Real-time copying** — WebSocket stream of platform trades (sub-second reaction), REST polling as reconciliation + fallback, per-trade dedupe across both paths
