@@ -541,6 +541,33 @@ def reconcile_ghosts():
         save_state()
 
 
+def reconcile_odometer():
+    """Keep the in-play odometer honest against the stakes actually at risk.
+
+    FLOOR: spent_live never reads below the sum of open live stakes (heals stale
+    under-counts). CEILING (only when no buy is mid-placement): spent_live is
+    exactly the open stakes — any excess is settled-loss cruft. That excess used
+    to 'stay counted' as a drawdown throttle, but the wallet-following cap
+    (SPEND_CAP = wallet − reserve) already throttles on drawdown; counting it
+    twice let the odometer ratchet above the cap with nothing open, freezing the
+    bot with no way down (no open position left to free cost). Releasing to the
+    real money-at-risk fixes that and self-heals every time the book goes flat.
+    Guarded on no in-flight/pending buy so it can never race a placement into a
+    double-spend. Returns the amount released (for the log)."""
+    released = 0.0
+    with LOCK:
+        floor = round(sum(STATE["live_cost"].values()), 2)
+        if STATE["spent_live"] < floor:
+            STATE["spent_live"] = floor
+        elif STATE["spent_live"] > floor and not INFLIGHT_BUYS and not STATE["pending"]:
+            released = round(STATE["spent_live"] - floor, 2)
+            STATE["spent_live"] = floor
+    if released >= 0.01:
+        logline(kind="skip", note=f"budget reconcile: released ${released:.2f} of settled-loss cruft; "
+                                  f"money at risk is ${floor:.2f} (the cap already tracks the wallet)")
+    return released
+
+
 def auto_cap():
     """Wallet-driven sizing: SPEND_CAP = total − reserve, MAX_USDC_PER_TRADE = %
     of total ($5 floor). Budgets then breathe with wins/losses, no manual bumps."""
@@ -1272,10 +1299,7 @@ def bot_loop():
         fetch_wallet()
         settle_resolved()
         reconcile_ghosts()
-        with LOCK:  # in-play can never read below the stakes still on open live copies
-            floor = round(sum(STATE["live_cost"].values()), 2)
-            if STATE["spent_live"] < floor:
-                STATE["spent_live"] = floor
+        reconcile_odometer()  # floor to open stakes; release settled-loss cruft when flat
         auto_cap()
         polls += 1
 
@@ -2278,13 +2302,26 @@ def _check():
     assert "g4" not in STATE["holdings"] and "g4" not in STATE["live_cost"]
     STATE["holdings"].pop("gX", None)
     STATE["live_cost"] = {}
-    # in-play floor (bot_loop): spent_live can't read below open live stakes (heals stale under-counts)
+    # odometer reconcile: floor lifts spent_live up to open stakes; when flat it also
+    # releases settled-loss cruft (the deadlock fix) — but never while a buy is in flight
+    INFLIGHT_BUYS.clear(); STATE["pending"] = {}
     STATE["live_cost"] = {"z1": 2.17}
     STATE["spent_live"] = 0.0
-    _floor = round(sum(STATE["live_cost"].values()), 2)
-    if STATE["spent_live"] < _floor:
-        STATE["spent_live"] = _floor
-    assert STATE["spent_live"] == 2.17, STATE["spent_live"]
+    reconcile_odometer()
+    assert STATE["spent_live"] == 2.17, STATE["spent_live"]     # floor lifts the under-count up
+    STATE["spent_live"] = 9.99                                  # stale cruft above real risk
+    reconcile_odometer()
+    assert STATE["spent_live"] == 2.17, STATE["spent_live"]     # released down to money at risk
+    STATE["live_cost"] = {}
+    reconcile_odometer()
+    assert STATE["spent_live"] == 0.0, STATE["spent_live"]      # fully flat -> odometer zero (deadlock cleared)
+    STATE["live_cost"] = {"z2": 3.0}; STATE["spent_live"] = 8.0
+    INFLIGHT_BUYS.add("zX")
+    reconcile_odometer()
+    assert STATE["spent_live"] == 8.0, STATE["spent_live"]      # held: a buy is mid-placement, no release
+    INFLIGHT_BUYS.discard("zX")
+    reconcile_odometer()
+    assert STATE["spent_live"] == 3.0, STATE["spent_live"]      # released once the book is flat again
     STATE["live_cost"] = {}
     globals()["market_state"] = _real_ms
     # synth wallet rows: blind-spot holdings appear, but never fool the reconciler
