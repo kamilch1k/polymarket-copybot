@@ -89,9 +89,12 @@ STATE = {
 }
 
 
-def check_deps():
+def check_deps(log=True):
     """Surface any missing runtime module at startup as a loud banner, instead of
-    letting it fail cryptically deep inside the Test-trade / auto-live path."""
+    letting it fail cryptically deep inside the Test-trade / auto-live path.
+    Re-run quietly by bot_loop while modules are flagged missing: a transient
+    import failure (pip mid-upgrade, locked site-packages) must not strand the
+    bot in DRY forever after the environment heals — that cost 6 live hours once."""
     missing = []
     for mod, pip_name in (("requests", "requests"), ("websocket", "websocket-client"),
                           ("regex", "regex"), ("py_clob_client_v2", "py-clob-client-v2")):
@@ -100,7 +103,7 @@ def check_deps():
         except Exception:
             missing.append(pip_name)
     STATE["missing_deps"] = missing
-    if missing:
+    if missing and log:
         logline(kind="error", note="missing modules: " + ", ".join(missing)
                 + " — run: pip install " + " ".join(missing) + " , then relaunch")
     return missing
@@ -1291,6 +1294,12 @@ def bot_loop():
     try_go_live("startup")
     polls = 0
     while True:
+        if STATE["missing_deps"] and not check_deps(log=False):
+            # environment healed (pip finished / lock released): restart the realtime
+            # thread (its import failed once and it exited) and re-arm via auto-live
+            logline(kind="live", note="runtime modules recovered — realtime restarted, live re-armed if configured")
+            threading.Thread(target=ws_loop, daemon=True).start()
+            try_go_live("deps recovered")
         if polls % LEADERS_EVERY == 0:  # leaderboard loads even before a target is set
             leaders = fetch_leaders()
             if leaders:
@@ -2393,7 +2402,9 @@ def _check():
     assert "Ask Claude" in page and "action=/ask" in page
     STATE["missing_deps"] = ["regex"]  # banner surfaces missing runtime deps
     assert "Missing Python modules" in render_dyn() and "pip install regex" in render_dyn()
-    STATE["missing_deps"] = []
+    # a transient import failure heals: the quiet re-check clears the flag
+    # (all deps exist in the test env), which is what lets bot_loop re-arm
+    assert check_deps(log=False) == [] and STATE["missing_deps"] == []
     # chat persistence round-trips through disk
     chat_add("you", "does the chat save?")
     STATE["chat"].clear()
