@@ -364,6 +364,121 @@ win rate; n has to grow before the win rate testifies either way.
 - Sample sizes are honest but small: one week, 44 settled copies. The math picks
   *plausible* edges; it cannot promise them.
 
+## Will *you* make money? — expected returns, honestly derived
+
+Everything above argues the copy *mechanism* works. This section answers the
+question that actually matters: **if you run this bot, what is the probability
+distribution of your outcome** — and how does it compare to boring
+alternatives? All parameters below are measured from the live ledger
+(n = 61 fills, 44 settled copies, 18 distinct events, Jul 3–10).
+
+### The per-copy return model
+
+A copy stakes a fraction κ of the bankroll at mean entry price p̄ and resolves
+binary. Measured: p̄ = 0.567, mean stake $2.93 on a ~$42 wallet → κ ≈ 0.07.
+
+```math
+R=\begin{cases}+a=\dfrac{1-\bar p}{\bar p}\approx +0.764 & \text{w.p. } w\\[4pt] -1 & \text{w.p. } 1-w\end{cases}
+\qquad\Longrightarrow\qquad
+\mu=\mathbb{E}[R]=\frac{w}{\bar p}-1,\quad \sigma^2=wa^2+(1-w)-\mu^2\approx 0.75
+```
+
+With the measured win rate w = 26/44 = 0.591:
+
+```math
+\widehat{\mu} \;=\; +4.2\%\ \text{per staked dollar},
+\qquad 95\%\ \text{CI}:\ \big[\,{-21\%},\ +30\%\,\big]
+```
+
+That interval is the single most important number on this page: at n = 44 the
+**sign of the edge is not statistically established** (consistent with the
+binomial test above). Everything below is conditional on scenarios for the
+true w.
+
+### Volatility drag, and where the bot sits vs Kelly
+
+Compounding doesn't earn μ — it earns the log-growth, which variance taxes:
+
+```math
+g(\kappa)=w\ln(1+\kappa a)+(1-w)\ln(1-\kappa)\;\approx\;\kappa\mu-\tfrac12\kappa^2\sigma^2,
+\qquad \kappa^{*}_{\text{Kelly}}=\frac{\mu}{\sigma^2}\approx 5.6\%
+```
+
+The bot's realized κ ≈ 7% is ≈ 1.24× Kelly at the point estimates — mildly
+aggressive (it burns ~7% of the theoretical growth rate; g/day 0.0069 vs
+0.0074 at κ\*). The sharper warning cuts the other way: if the true edge sits
+in the lower half of the CI, the *same* sizing is deep over-Kelly, where
+expected log-growth is negative even with a positive-EV coin.
+
+### Correlation makes the variance bigger than it looks
+
+The 44 settled copies cluster into 18 events (mean cluster 2.4 legs, worst 8 —
+Argentina–Egypt). Same-event legs are strongly correlated, so effective
+variance carries a design effect d_eff = 1+(m̄−1)ρ ≈ **1.7** at ρ = 0.5.
+Drift is unchanged; risk is ~70% larger than an independence assumption says.
+
+### The month-ahead distribution
+
+At ~6.3 settled copies/day, a month is N ≈ 189 copies and the log-outcome is
+approximately normal:
+
+```math
+\ln\frac{W_{30}}{W_{0}}\;\sim\;\mathcal{N}\Big(N\,g(\kappa),\;\; N\,\mathrm{Var}\big[\ln(1+\kappa R)\big]\,d_{\text{eff}}\Big),
+\qquad \text{month } \sigma_{\ln}\approx 1.1
+```
+
+The answer to "what are the chances of good returns," by true-win-rate
+scenario — note the first row sits **inside** the confidence interval:
+
+| true w scenario | median month | middle 50% of months | P(green month) | P(2×) | P(½×) |
+|---|---|---|---|---|---|
+| 0.550 — cold streak (inside the CI) | **−53%** | −78% … 0% | 25% | 10% | 52% |
+| 0.567 — pure breakeven (w = p̄) | −30% | −67% … +48% | 37% | 17% | 38% |
+| 0.583 — breakeven incl. modeled frictions | +2% | −51% … +115% | 51% | 27% | 26% |
+| 0.591 — **measured** | **+23%** | −41% … +158% | **57%** | 33% | 21% |
+| 0.650 — optimistic | +390% | +139% … +905% | 93% | 80% | 2% |
+
+(Two breakeven rows because fills already embed the spread we crossed —
+w = p̄ is the pure bar; 0.583 adds the residual frictions modeled earlier.)
+
+### Reality checks on the table
+
+- **Week 1 was lucky, quantifiably.** Realized ln(50.83/33.11) = 0.43 against
+  the fitted model N(0.048, 0.53²) is a **z = +0.72** draw — within 1σ, mildly
+  fortunate, and precisely the reason the median row above says +23%, not +53%.
+- **The left tail is bounded by construction** — the cap follows
+  wallet − $8 reserve, so the worst structural outcome is ≈ −84% of the
+  current bankroll, not −100% (software risk aside; see the safety section).
+- **Publication bias applies to us.** This analysis went up after a green
+  week. The winner's-curse bound from the selection math applies to the
+  authors as much as to the leaderboard.
+- **Non-stationarity.** Every parameter was measured in World Cup 2026
+  liquidity, which ends July 19. The "true w" column is not a constant of
+  nature; it is a moving target the roster re-screen chases.
+
+### Against normal methods
+
+| vehicle | typical month | month σ (log) | P(green month) | absorbs real capital? |
+|---|---|---|---|---|
+| savings account (~4%/yr) | +0.33% | ≈ 0 | ~100% | yes |
+| S&P index (long-run averages) | +0.7% | 0.044 | ≈ 56% | yes |
+| **this bot** @ measured edge | median +23% | **1.10** | ≈ 57% | **no** — the edge lives at $1–7 clips |
+
+Read that middle column twice: the bot offers *the same coin-odds of a green
+month as an index fund* (57% vs 56%) at **~25× the volatility** — the entire
+difference lives in the tails, both of them. The log-Sharpe at the measured
+edge (≈ 0.19/month ≈ 0.65 annualized) is *comparable to simply holding
+equities*, not better — before counting the capacity ceiling: FAK fill
+quality collapses well below institutional size (the RJW1 fill-anatomy
+lesson), so even a perfect month at the measured edge on this bankroll is
+roughly **+$12 median**. 
+
+**Bottom line, in words:** the math says this is a small, real-looking,
+statistically unconfirmed edge riding on casino-grade variance with a hard
+capacity ceiling. As entertainment with a positive tilt and an audited
+ledger, it is exactly what it claims to be. As a substitute for investing, it
+is not one — and this section is the proof.
+
 ## Long-horizon markets — why the bot skips them today, and when that flips
 
 The roster trades six-month politics futures, Fed-meeting markets and election
