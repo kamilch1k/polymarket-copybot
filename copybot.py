@@ -88,6 +88,7 @@ STATE = {
     "live_cost": {},             # token -> live $ spent on it (resolve/sell frees budget)
     "bought_at": {},             # token -> epoch of our buy (ghost-reconcile grace period)
     "missing_deps": [],          # runtime modules that failed to import at startup
+    "who": {},                   # token -> trader we copied the open position from
 }
 
 
@@ -256,6 +257,14 @@ def load_state():
     STATE["spent_live"] = s.get("spent_live", 0.0)
     STATE["live_cost"] = s.get("live_cost", {})
     STATE["bought_at"] = s.get("bought_at", {})
+    STATE["who"] = s.get("who", {})
+    # backfill attribution for positions bought before the who-map existed:
+    # BUY history entries have carried the trader name since day one
+    bywho = {e.get("name"): e["who"] for e in STATE["history"]
+             if e.get("side") == "BUY" and e.get("who")}
+    for tid, nm in STATE["names"].items():
+        if tid not in STATE["who"] and STATE["holdings"].get(tid, 0) > 0 and bywho.get(nm):
+            STATE["who"][tid] = bywho[nm]
     if audit_ledger_0707():
         save_state()
 
@@ -265,7 +274,7 @@ def save_state():
         data = {"seen": sorted(STATE["seen"]), "holdings": STATE["holdings"],
                 "names": STATE["names"], "history": STATE["history"][-500:],
                 "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"],
-                "bought_at": STATE["bought_at"]}
+                "bought_at": STATE["bought_at"], "who": STATE["who"]}
     STATE_FILE.write_text(json.dumps(data))
 
 
@@ -811,6 +820,8 @@ def _order(tid, side, shares, ref, name, drift=None, who=""):
     with LOCK:
         STATE["log"].appendleft(e)
         STATE["history"].append(e)
+        if side == "BUY" and who and kind in ("live", "dry"):
+            STATE["who"][tid] = who  # remember whose trade this position mirrors
     return kind in ("live", "dry")  # only an actually-placed order updates holdings
 
 
@@ -1490,6 +1501,7 @@ def _fmt_ends(p):
 def _wallet_card():
     with LOCK:
         w = dict(STATE["wallet"])
+        who = dict(STATE["who"])
     allpos = w.get("positions", [])
     pos = [p for p in allpos if float(p.get("currentValue") or 0) > 0.02]   # worth showing
     dust = len(allpos) - len(pos)                                            # settled/worthless
@@ -1506,7 +1518,9 @@ def _wallet_card():
                     f'onsubmit="return confirm(\'Sell this whole position at market now?\')">'
                     f'<input type=hidden name=tid value="{p["asset"]}">'
                     f'<button class=dry title="market-sell the whole position">sell</button></form>')
-        rows += (f'<tr><td>{p.get("title", "?")} — {p.get("outcome", "?")}</td>'
+        via = who.get(p.get("asset"), "")
+        via = f' <span class=dim>· via {via}</span>' if via else ""
+        rows += (f'<tr><td>{p.get("title", "?")} — {p.get("outcome", "?")}{via}</td>'
                  f'<td class=r>{float(p.get("size") or 0):g}</td>'
                  f'<td class=r>{float(p.get("avgPrice") or 0):.3f} → {float(p.get("curPrice") or 0):.3f}</td>'
                  f'<td class=r>${float(p.get("currentValue") or 0):,.2f}</td>'
@@ -1890,7 +1904,7 @@ def render_dyn():
     with LOCK:
         live, copies, err = STATE["live"], STATE["copies"], STATE["error"]
         started, last = STATE["started"], STATE["last_poll"]
-        holdings = [(STATE["names"].get(k, k[:16]), v) for k, v in STATE["holdings"].items() if v > 0]
+        holdings = [(STATE["names"].get(k, k[:16]), v, STATE["who"].get(k, "")) for k, v in STATE["holdings"].items() if v > 0]
         tnames = dict(STATE["tnames"])
         feed = list(STATE["target_feed"])
         log = list(STATE["log"])
@@ -1909,7 +1923,8 @@ def render_dyn():
     else:
         toggle = '<span class="tag dim">configure ⚙ to enable live</span>'
 
-    hrows = "".join(f"<tr><td>{n}</td><td class=r>{s:g}</td></tr>" for n, s in holdings) \
+    hrows = "".join(f'<tr><td>{n}{f" <span class=dim>· via {w_}</span>" if w_ else ""}</td>'
+                    f'<td class=r>{s:g}</td></tr>' for n, s, w_ in holdings) \
         or "<tr><td colspan=2 class=dim>no open positions</td></tr>"
     intents = [e for e in log if e.get("kind") == "dry" and e.get("side") == "BUY"][:8]
     irows = "".join(f'<tr><td class=dim>{e["t"]}</td><td>{e.get("name", "")}</td>'
@@ -2310,10 +2325,18 @@ def _check():
             "title": "Philadelphia Phillies vs. Detroit Tigers: O/U 7.5", "outcome": "Under"})
     assert "per-match cap" in STATE["log"][0]["note"] and STATE["holdings"].get("e3") is None
     handle({"asset": "e4", "side": "BUY", "price": 0.5, "size": 1000,
-            "title": "Seattle Mariners vs. Tampa Bay Rays: O/U 7.5", "outcome": "Under"})
+            "title": "Seattle Mariners vs. Tampa Bay Rays: O/U 7.5", "outcome": "Under",
+            "_who": "cnyek"})
     assert STATE["holdings"].get("e4", 0) > 0, "different event must pass the cap"
+    assert STATE["who"].get("e4") == "cnyek"  # position remembers whose trade it mirrors
+    # ...and the wallet card surfaces it next to the position
+    STATE["wallet"] = {"usdc": 1.0, "positions": [{"asset": "e4", "title": "Seattle Mariners vs. Tampa Bay Rays: O/U 7.5",
+                                                   "outcome": "Under", "size": 2.0, "curPrice": 0.5, "currentValue": 1.0}]}
+    assert "via cnyek" in _wallet_card()
+    STATE["wallet"] = {}
     for k in ("e1", "e2", "e4"):
         STATE["holdings"].pop(k, None)
+        STATE["who"].pop(k, None)
     # resolution frees budget: live win credits, dry win doesn't, loss stays counted
     STATE["holdings"].update({"w1": 2.0, "w2": 3.0, "w3": 4.0})
     STATE["live_cost"] = {"w1": 1.0, "w3": 1.2}
