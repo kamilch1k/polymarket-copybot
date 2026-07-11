@@ -47,6 +47,8 @@ SLIPPAGE = 0.02              # accept up to this much worse than his fill
 MIN_HIS_NOTIONAL = 0.0        # copy his BUY only if he put >= this many $ in (0 = no floor)
 SPEND_CAP = 15.0             # hard stop: total live BUY $ the bot may ever spend (sells always allowed)
 MAX_DAYS_OUT = 0.0           # only copy BUYs on markets ending within N days (0 = any horizon)
+MAX_LEGS_PER_EVENT = 2       # max open BUY legs per match/event (0 = uncapped) — same-match
+                             # legs are near-perfectly correlated: m legs act as ONE bet at m× size
 AUTO_CAP_RESERVE = 8.0       # auto-budget: SPEND_CAP = wallet total − this reserve (0 = manual cap)
 AUTO_TRADE_PCT = 10.0        # auto-size: MAX_USDC_PER_TRADE = this % of wallet, $5 floor (0 = manual)
 MODE = "auto"                 # "auto" = copy instantly · "approve" = queue for your click
@@ -138,6 +140,15 @@ def key(trade):
     return f"{trade['transactionHash']}:{trade['asset']}:{trade['side']}"
 
 
+def event_key(title):
+    """Same-match legs share an 'X vs. Y' title prefix — that's the correlation
+    unit the per-match cap counts. Titles without a versus-prefix (props,
+    'Will X win…') each stay their own event; identical-market stacking is
+    already blocked by the no-stacking gate."""
+    head = str(title or "").split(":", 1)[0].strip().lower()
+    return head if " vs" in head else str(title or "").strip().lower()
+
+
 def copy_stats(feed):
     trades = [t for t in feed if t.get("side")]
     if not trades:
@@ -217,6 +228,7 @@ def load_config():
     SIGNATURE_TYPE = c.get("sig_type", SIGNATURE_TYPE)
     globals()["SPEND_CAP"] = c.get("spend_cap", SPEND_CAP)
     globals()["MAX_DAYS_OUT"] = c.get("max_days_out", MAX_DAYS_OUT)
+    globals()["MAX_LEGS_PER_EVENT"] = int(c.get("max_legs_per_event", MAX_LEGS_PER_EVENT))
     globals()["AUTO_CAP_RESERVE"] = c.get("auto_cap_reserve", AUTO_CAP_RESERVE)
     globals()["AUTO_TRADE_PCT"] = c.get("auto_trade_pct", AUTO_TRADE_PCT)
     STATE["funder"] = c.get("funder", "")
@@ -228,6 +240,7 @@ def save_config():
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
         "mode": MODE, "min_his": MIN_HIS_NOTIONAL, "sig_type": SIGNATURE_TYPE,
         "spend_cap": SPEND_CAP, "max_days_out": MAX_DAYS_OUT,
+        "max_legs_per_event": MAX_LEGS_PER_EVENT,
         "auto_cap_reserve": AUTO_CAP_RESERVE, "auto_trade_pct": AUTO_TRADE_PCT,
         "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
@@ -895,6 +908,18 @@ def handle(trade):
                 if ets and (ets - time.time()) > MAX_DAYS_OUT * 86400:
                     logline(kind="skip", side="BUY", name=name, who=who,
                             note=f"resolves in {(ets - time.time()) / 86400:.0f}d — beyond your {MAX_DAYS_OUT:g}d horizon")
+                    return
+            if MAX_LEGS_PER_EVENT > 0:
+                ev = event_key(name.rpartition(" — ")[0])
+                with LOCK:
+                    legs = sum(1 for t2, s2 in STATE["holdings"].items() if s2 > 0 and t2 != tid
+                               and event_key(STATE["names"].get(t2, "").rpartition(" — ")[0]) == ev)
+                    legs += sum(1 for p in STATE["pending"].values() if p.get("side") == "BUY"
+                                and event_key(str(p.get("name", "")).rpartition(" — ")[0]) == ev)
+                if legs >= MAX_LEGS_PER_EVENT:
+                    logline(kind="skip", side="BUY", name=name, who=who,
+                            note=f"per-match cap: {legs} leg(s) already open on this event — "
+                                 f"correlated legs act as one bet at {legs + 1}× size")
                     return
             shares = my_buy_size(his, price)
             if shares <= 0:
@@ -1816,6 +1841,7 @@ def _settings_form():
   <label>Hard stop: total live buys ≤ $<input name=spend_cap id=capin value="{SPEND_CAP}">
     <span id=capnote class=dim style="display:none">← overridden while auto budget is on</span></label>
   <label>Only copy markets ending within <input name=max_days_out value="{MAX_DAYS_OUT:g}"> days (0 = any horizon; sells always follow)</label>
+  <label>Max open legs per match/event <input name=max_legs_per_event value="{MAX_LEGS_PER_EVENT}"> (0 = uncapped — same-match legs are correlated: m legs ≈ one bet at m× size)</label>
   <label><span style="display:flex;align-items:center;gap:6px"><input type=checkbox id=acr_on style="width:auto;margin:0">
     Auto budget — cap = wallet total minus this $ reserve (uncheck for manual cap)</span>
     <input name=auto_cap_reserve id=acr value="{AUTO_CAP_RESERVE:g}"></label>
@@ -2177,6 +2203,7 @@ class Handler(BaseHTTPRequestHandler):
             MIN_HIS_NOTIONAL = num("min_his", MIN_HIS_NOTIONAL)
             globals()["SPEND_CAP"] = num("spend_cap", SPEND_CAP)
             globals()["MAX_DAYS_OUT"] = num("max_days_out", MAX_DAYS_OUT)
+            globals()["MAX_LEGS_PER_EVENT"] = int(num("max_legs_per_event", MAX_LEGS_PER_EVENT))
             globals()["AUTO_CAP_RESERVE"] = num("auto_cap_reserve", AUTO_CAP_RESERVE)
             globals()["AUTO_TRADE_PCT"] = num("auto_trade_pct", AUTO_TRADE_PCT)
             SLIPPAGE = num("slippage", SLIPPAGE)
@@ -2270,6 +2297,23 @@ def _check():
     assert "cooling down" in STATE["log"][0]["note"] and STATE["holdings"].get("t9") is None
     FAILED_BUY_AT.clear()
     globals()["MAX_DAYS_OUT"] = 0.0
+
+    # per-match cap: same-event legs share an event key; a third leg is refused,
+    # a different match sails through (the Phillies O/U ladder / Egypt basket fix)
+    assert event_key("Argentina vs. Egypt: O/U 2.5") == event_key("Argentina vs. Egypt: Team to Advance")
+    assert event_key("Will Spain win on 2026-07-10?") != event_key("Spain vs. Belgium: O/U 2.5")
+    globals()["MAX_LEGS_PER_EVENT"] = 2
+    STATE["holdings"].update({"e1": 3.0, "e2": 2.0})
+    STATE["names"]["e1"] = "Philadelphia Phillies vs. Detroit Tigers: O/U 9.5 — Under"
+    STATE["names"]["e2"] = "Philadelphia Phillies vs. Detroit Tigers: O/U 8.5 — Under"
+    handle({"asset": "e3", "side": "BUY", "price": 0.5, "size": 1000,
+            "title": "Philadelphia Phillies vs. Detroit Tigers: O/U 7.5", "outcome": "Under"})
+    assert "per-match cap" in STATE["log"][0]["note"] and STATE["holdings"].get("e3") is None
+    handle({"asset": "e4", "side": "BUY", "price": 0.5, "size": 1000,
+            "title": "Seattle Mariners vs. Tampa Bay Rays: O/U 7.5", "outcome": "Under"})
+    assert STATE["holdings"].get("e4", 0) > 0, "different event must pass the cap"
+    for k in ("e1", "e2", "e4"):
+        STATE["holdings"].pop(k, None)
     # resolution frees budget: live win credits, dry win doesn't, loss stays counted
     STATE["holdings"].update({"w1": 2.0, "w2": 3.0, "w3": 4.0})
     STATE["live_cost"] = {"w1": 1.0, "w3": 1.2}
