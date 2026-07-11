@@ -1519,7 +1519,8 @@ def _wallet_card():
                     f'<input type=hidden name=tid value="{p["asset"]}">'
                     f'<button class=dry title="market-sell the whole position">sell</button></form>')
         via = who.get(p.get("asset"), "")
-        via = f' <span class=dim>· via {via}</span>' if via else ""
+        via = (f' <span class=dim title="{html.escape(via, quote=True)}">· via {_short(via)}</span>'
+               if via else "")
         rows += (f'<tr><td>{p.get("title", "?")} — {p.get("outcome", "?")}{via}</td>'
                  f'<td class=r>{float(p.get("size") or 0):g}</td>'
                  f'<td class=r>{float(p.get("avgPrice") or 0):.3f} → {float(p.get("curPrice") or 0):.3f}</td>'
@@ -1581,6 +1582,53 @@ def _target_rows():
                 f'<td class=dim>{t.get("_who", "")}</td><td style=color:{col}>{side}</td><td>{name}</td>'
                 f'<td class=r>{float(t.get("size", 0)):g}</td><td class=r>@{t.get("price", "")}</td><td>{act}</td></tr>')
     return out or "<tr><td colspan=7 class=dim>no recent activity</td></tr>"
+
+
+def _short(nm, k=18):
+    """Display-shorten long trader pseudonyms; the full name stays in tooltips."""
+    nm = str(nm or "")
+    return nm if len(nm) <= k else nm[:k - 1] + "…"
+
+
+def _prof_btn(addr, label, tip):
+    return (f'<form method=post action=/openpm style=display:inline>'
+            f'<input type=hidden name=addr value="{addr}">'
+            f'<button class=copy title="{tip}">{label} ↗</button></form>')
+
+
+def _roster_card():
+    """One place to manage who the bot copies: see, inspect, drop, add."""
+    with LOCK:
+        tnames = dict(STATE["tnames"])
+        who = dict(STATE["who"])
+        open_by = {}
+        for t, s in STATE["holdings"].items():
+            if s > 0 and who.get(t):
+                open_by[who[t]] = open_by.get(who[t], 0) + 1
+    rows = ""
+    for a in list(TARGETS):
+        nm = tnames.get(a, a[:8] + "…")
+        n_open = open_by.get(nm, 0)
+        rows += (
+            f'<tr><td><b title="{html.escape(nm, quote=True)}">{_short(nm)}</b> '
+            f'<span class="tag dim">{a[:6]}…{a[-4:]}</span></td>'
+            f'<td class=dim>{n_open or "no"} open {"copy" if n_open == 1 else "copies"}</td>'
+            f'<td class=r>{_prof_btn(a, "profile", "open their Polymarket profile in your browser")} '
+            f'<form method=post action=/target style=display:inline '
+            f'onsubmit="return confirm(\'Stop copying this trader? Open positions stay yours.\')">'
+            f'<input type=hidden name=addr value="{a}">'
+            f'<button class=kill title="stop copying — no new trades mirrored; open positions stay and can be sold from the wallet card">✕ stop</button></form></td></tr>')
+    rows = rows or '<tr><td colspan=3 class=dim>no targets yet — paste an address below, or use the scout</td></tr>'
+    return (
+        f'<div class=card style=margin-bottom:16px><h2 style=margin-top:0>Copying roster — who the bot mirrors</h2>'
+        f'<table><tr><th>trader</th><th>positions</th><th class=r></th></tr>{rows}</table>'
+        f'<form method=post action=/target style="display:flex;gap:8px;margin-top:10px">'
+        f'<input name=addr placeholder="paste a trader&#39;s 0x wallet address to start copying them" required '
+        f'pattern="0x[0-9a-fA-F]{{40}}" title="a Polymarket wallet address: 0x followed by 40 hex characters" '
+        f'style="flex:1;background:#0f1523;border:1px solid #334155;border-radius:8px;color:#e5e7eb;padding:8px 10px;font:inherit">'
+        f'<button class=go>▶ start copying</button></form>'
+        f'<div class=dim style="margin-top:6px">adding baselines their past trades and copies from now on · '
+        f'removing stops new copies (open positions stay yours) · the scout finds candidates by the selection math</div></div>')
 
 
 def _status_card():
@@ -1923,7 +1971,7 @@ def render_dyn():
     else:
         toggle = '<span class="tag dim">configure ⚙ to enable live</span>'
 
-    hrows = "".join(f'<tr><td>{n}{f" <span class=dim>· via {w_}</span>" if w_ else ""}</td>'
+    hrows = "".join(f'<tr><td>{n}{f" <span class=dim>· via {_short(w_)}</span>" if w_ else ""}</td>'
                     f'<td class=r>{s:g}</td></tr>' for n, s, w_ in holdings) \
         or "<tr><td colspan=2 class=dim>no open positions</td></tr>"
     intents = [e for e in log if e.get("kind") == "dry" and e.get("side") == "BUY"][:8]
@@ -1948,12 +1996,7 @@ def render_dyn():
     funder = STATE.get("funder") or os.environ.get("PM_FUNDER", "")
     funder_chip = f'<span class="tag dim">funder {funder}</span>' if funder else ""
 
-    def _prof_btn(addr, label, tip):
-        return (f'<form method=post action=/openpm style=display:inline>'
-                f'<input type=hidden name=addr value="{addr}">'
-                f'<button class=copy title="{tip}">{label} ↗</button></form>')
-
-    tgt_btns = " ".join(_prof_btn(a, tnames.get(a, a[:8] + "…"),
+    tgt_btns = " ".join(_prof_btn(a, _short(tnames.get(a, a[:8] + "…"), 14),
                                   "open their Polymarket profile in your browser") for a in TARGETS) \
         or '<span class="tag dim">no target set</span>'
     me_btn = _prof_btn(funder, "my profile", "open your Polymarket profile in your browser") if funder else ""
@@ -1973,6 +2016,7 @@ def render_dyn():
 {errbar}
 {_chat_card()}
 {_status_card()}
+{_roster_card()}
 {_pending_card()}
 {_wallet_card()}
 <div class=grid>
@@ -1992,7 +2036,7 @@ def render_dyn():
   </div>
 </div>
 {_scout_card()}
-<h2>Who else to copy (leaderboard — click to switch target)</h2>
+<h2>Who else to copy (leaderboard — "copy" adds to the roster, click again to remove)</h2>
 <div class=card><table><tr><th>#</th><th>trader</th><th class=r>pnl</th><th></th></tr>{_leader_rows()}</table></div>
 <h2>Trade history</h2>
 <div class=card><table><tr><th>when</th><th>kind</th><th>side</th><th>market — outcome</th><th class=r>size</th><th>note</th></tr>{_history_rows()}</table></div>
@@ -2337,6 +2381,20 @@ def _check():
     for k in ("e1", "e2", "e4"):
         STATE["holdings"].pop(k, None)
         STATE["who"].pop(k, None)
+
+    # roster card: every target listed with a stop button + an add form; long
+    # pseudonyms display-shortened everywhere (full name survives in tooltips)
+    assert _short("RISK-IS-NEVER-OK") == "RISK-IS-NEVER-OK"
+    longnm = "0x3DFb153c197D4C19D3B31c1ecD2c7B6860eeabAf-1722957908185"
+    assert len(_short(longnm)) == 18 and _short(longnm).endswith("…")
+    _ta = "0x" + "a" * 40
+    TARGETS.append(_ta)
+    STATE["tnames"][_ta] = "TestTrader"
+    card = _roster_card()
+    assert "TestTrader" in card and "start copying" in card and "✕ stop" in card
+    assert card.count("action=/target") == 2  # one stop button + the add form
+    TARGETS.remove(_ta)
+    assert "no targets yet" in _roster_card()
     # resolution frees budget: live win credits, dry win doesn't, loss stays counted
     STATE["holdings"].update({"w1": 2.0, "w2": 3.0, "w3": 4.0})
     STATE["live_cost"] = {"w1": 1.0, "w3": 1.2}
