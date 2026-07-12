@@ -49,6 +49,10 @@ SLIPPAGE = 0.02              # accept up to this much worse than his fill
 MIN_HIS_NOTIONAL = 0.0        # copy his BUY only if he put >= this many $ in (0 = no floor)
 SPEND_CAP = 15.0             # hard stop: total live BUY $ the bot may ever spend (sells always allowed)
 MAX_DAYS_OUT = 0.0           # only copy BUYs on markets ending within N days (0 = any horizon)
+TEDGE = {}                    # per-trader edge override, addr(lower) -> % (unset = EDGE_EST);
+                              # scout adds arm this with the measured pessimistic edge
+TDAYS = {}                    # per-trader horizon override, addr(lower) -> days (unset = MAX_DAYS_OUT)
+SCOUT_EVERY_DAYS = 7.0        # auto-rerun the trader scout every N days (0 = manual button only)
 MAX_LEGS_PER_EVENT = 2       # max open BUY legs per match/event (0 = uncapped) — same-match
                              # legs are near-perfectly correlated: m legs act as ONE bet at m× size
 TP_PRICE = 0.95              # auto take-profit: sell when a position's mid reaches this price
@@ -103,6 +107,7 @@ STATE = {
     "bought_at": {},             # token -> epoch of our buy (ghost-reconcile grace period)
     "missing_deps": [],          # runtime modules that failed to import at startup
     "who": {},                   # token -> trader we copied the open position from
+    "last_scout": 0.0,           # when the weekly auto-scout last ran (persisted across restarts)
     "hwm": 0.0,                  # all-time-high wallet equity (cash + positions) — display truth
     "banked": 0.0,               # profit locked at new highs — the cap never redeploys it
     "bank_base": 0.0,            # level up to which profit has been banked (≠ hwm: small gains
@@ -145,17 +150,19 @@ def bankroll_at_play():
     return max(0.0, total - banked)
 
 
-def my_buy_size(price, bankroll=None, cap=None):
+def my_buy_size(price, bankroll=None, cap=None, edge=None):
     """Fractional-Kelly sizing, price-aware. A binary bought at price p has
     per-dollar variance (1-p)/p, so for an assumed net edge e the Kelly
     fraction is f* = e·p/(1-p) — longshots size themselves down, favorites up.
     We bet KELLY_MULT of f* (half-Kelly default) on at-play equity, clipped to
-    [$1 exchange minimum, per-trade cap]. Same market always beats same size."""
+    [$1 exchange minimum, per-trade cap]. Same market always beats same size.
+    `edge` = per-trader measured edge % (TEDGE); None falls back to the global."""
     if price <= 0 or price >= 1:
         return 0.0
     b = bankroll_at_play() if bankroll is None else bankroll
     cap = MAX_USDC_PER_TRADE if cap is None else cap
-    f = KELLY_MULT * (EDGE_EST / 100.0) * price / (1.0 - price)
+    e = EDGE_EST if edge is None else edge
+    f = KELLY_MULT * (e / 100.0) * price / (1.0 - price)
     notional = min(max(b * f, MIN_NOTIONAL), cap)
     return round(notional / price, 2)
 
@@ -252,6 +259,9 @@ def load_config():
     MODE = c.get("mode", MODE)
     globals()["EDGE_EST"] = float(c.get("edge_est", EDGE_EST))
     globals()["KELLY_MULT"] = float(c.get("kelly_mult", KELLY_MULT))
+    globals()["TEDGE"] = {str(k).lower(): float(v) for k, v in (c.get("tedge") or {}).items()}
+    globals()["TDAYS"] = {str(k).lower(): float(v) for k, v in (c.get("tdays") or {}).items()}
+    globals()["SCOUT_EVERY_DAYS"] = float(c.get("scout_days", SCOUT_EVERY_DAYS))
     MAX_USDC_PER_TRADE = c.get("cap", MAX_USDC_PER_TRADE)
     SLIPPAGE = c.get("slippage", SLIPPAGE)
     BANKROLL = c.get("bankroll", BANKROLL)
@@ -274,6 +284,7 @@ def save_config():
     CONFIG_FILE.write_text(json.dumps({  # includes the key: owner's choice, file is gitignored
         "targets": TARGETS, "funder": STATE.get("funder", ""),
         "edge_est": EDGE_EST, "kelly_mult": KELLY_MULT,
+        "tedge": TEDGE, "tdays": TDAYS, "scout_days": SCOUT_EVERY_DAYS,
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
         "mode": MODE, "min_his": MIN_HIS_NOTIONAL, "sig_type": SIGNATURE_TYPE,
         "spend_cap": SPEND_CAP, "max_days_out": MAX_DAYS_OUT,
@@ -296,6 +307,7 @@ def load_state():
     STATE["live_cost"] = s.get("live_cost", {})
     STATE["bought_at"] = s.get("bought_at", {})
     STATE["who"] = s.get("who", {})
+    STATE["last_scout"] = s.get("last_scout", 0.0)
     STATE["hwm"] = s.get("hwm", 0.0)
     STATE["banked"] = s.get("banked", 0.0)
     STATE["bank_base"] = s.get("bank_base", 0.0)
@@ -316,6 +328,7 @@ def save_state():
                 "names": STATE["names"], "history": STATE["history"][-500:],
                 "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"],
                 "bought_at": STATE["bought_at"], "who": STATE["who"],
+                "last_scout": STATE["last_scout"],
                 "hwm": STATE["hwm"], "banked": STATE["banked"], "bank_base": STATE["bank_base"]}
     STATE_FILE.write_text(json.dumps(data))
 
@@ -1011,11 +1024,13 @@ def handle(trade):
                 logline(kind="skip", side="BUY", name=name, who=who,
                         note=f"his ${his * price:,.0f} < ${MIN_HIS_NOTIONAL:,.0f} conviction floor")
                 return
-            if MAX_DAYS_OUT > 0:
+            days = TDAYS.get(pw, MAX_DAYS_OUT)  # per-trader horizon beats the global
+            if days > 0:
                 ets = market_end_ts(tid)
-                if ets and (ets - time.time()) > MAX_DAYS_OUT * 86400:
+                if ets and (ets - time.time()) > days * 86400:
+                    whose = "this trader's" if pw in TDAYS else "your"
                     logline(kind="skip", side="BUY", name=name, who=who,
-                            note=f"resolves in {(ets - time.time()) / 86400:.0f}d — beyond your {MAX_DAYS_OUT:g}d horizon")
+                            note=f"resolves in {(ets - time.time()) / 86400:.0f}d — beyond {whose} {days:g}d horizon")
                     return
             if MAX_LEGS_PER_EVENT > 0:
                 ev = event_key(name.rpartition(" — ")[0])
@@ -1029,7 +1044,7 @@ def handle(trade):
                             note=f"per-match cap: {legs} leg(s) already open on this event — "
                                  f"correlated legs act as one bet at {legs + 1}× size")
                     return
-            shares = my_buy_size(price)
+            shares = my_buy_size(price, edge=TEDGE.get(pw))  # his measured edge sizes his copies
             if shares <= 0:
                 logline(kind="skip", side="BUY", name=name, who=who, note="unpriced trade")
                 return
@@ -1245,6 +1260,7 @@ def bot_context():
             "live_trading": STATE["live"], "mode": MODE, "ws_realtime": STATE["ws"],
             "targets": [{"addr": a, "name": STATE["tnames"].get(a, "?")} for a in TARGETS],
             "settings": {"edge_est_pct": EDGE_EST, "kelly_mult": KELLY_MULT,
+                         "per_trader_edge_pct": dict(TEDGE), "per_trader_max_days": dict(TDAYS),
                          "max_usd_per_trade": MAX_USDC_PER_TRADE,
                          "min_his_buy_usd": MIN_HIS_NOTIONAL, "slippage": SLIPPAGE,
                          "bankroll_usd": BANKROLL},
@@ -1320,6 +1336,8 @@ def apply_actions(acts):
                 applied.append(f"added target {str(v)[:8]}…")
             elif op == "drop_target" and v in TARGETS:
                 TARGETS.remove(v)
+                TEDGE.pop(str(v).lower(), None)
+                TDAYS.pop(str(v).lower(), None)
                 applied.append(f"dropped target {str(v)[:8]}…")
         except (TypeError, ValueError):
             continue
@@ -1477,6 +1495,11 @@ def bot_loop():
         reconcile_odometer()  # floor to open stakes; release settled-loss cruft when flat
         auto_cap()
         take_profits()  # realize winners at TP thresholds instead of marking-and-hoping
+        if SCOUT_EVERY_DAYS > 0 and not SCOUT["running"] \
+                and time.time() - STATE["last_scout"] > SCOUT_EVERY_DAYS * 86400:
+            with LOCK:  # stamp first so a crash can't turn into a scan loop
+                STATE["last_scout"] = time.time()
+            threading.Thread(target=scout_auto, daemon=True).start()
         polls += 1
 
         if not TARGETS:
@@ -1747,25 +1770,36 @@ def _roster_card():
     for a in list(TARGETS):
         nm = tnames.get(a, a[:8] + "…")
         n_open = open_by.get(nm, 0)
+        ed, dy = TEDGE.get(a.lower()), TDAYS.get(a.lower())
         rows += (
             f'<tr><td><b title="{html.escape(nm, quote=True)}">{_short(nm)}</b> '
             f'<span class="tag dim">{a[:6]}…{a[-4:]}</span></td>'
             f'<td class=dim>{n_open or "no"} open {"copy" if n_open == 1 else "copies"}</td>'
+            f'<td><form method=post action=/tset style="display:inline-flex;gap:4px;align-items:center;margin:0">'
+            f'<input type=hidden name=addr value="{a}">'
+            f'<span class=dim>edge</span><input name=edge class=in value="{"" if ed is None else f"{ed:g}"}" '
+            f'placeholder="{EDGE_EST:g}" style="width:46px;padding:2px 4px" '
+            f'title="assumed net copy edge % for THIS trader — Kelly sizing uses it (blank = global {EDGE_EST:g}%; scout adds prefill their measured edge)">'
+            f'<span class=dim>% · ≤</span><input name=days class=in value="{"" if dy is None else f"{dy:g}"}" '
+            f'placeholder="{MAX_DAYS_OUT:g}" style="width:40px;padding:2px 4px" '
+            f'title="only copy THIS trader on markets ending within N days (blank = global; 0 = any horizon)">'
+            f'<span class=dim>d</span><button class=copy>set</button></form></td>'
             f'<td class=r>{_prof_btn(a, "profile", "open their Polymarket profile in your browser")} '
             f'<form method=post action=/target style=display:inline '
             f'onsubmit="return confirm(\'Stop copying this trader? Open positions stay yours.\')">'
             f'<input type=hidden name=addr value="{a}">'
             f'<button class=kill title="stop copying — no new trades mirrored; open positions stay and can be sold from the wallet card">✕ stop</button></form></td></tr>')
-    rows = rows or '<tr><td colspan=3 class=dim>no targets yet — paste an address below, or use the scout</td></tr>'
+    rows = rows or '<tr><td colspan=4 class=dim>no targets yet — paste an address below, or use the scout</td></tr>'
     return (
         f'<div class=card style=margin-bottom:16px><h2 style=margin-top:0>Copying roster — who the bot mirrors</h2>'
-        f'<table><tr><th>trader</th><th>positions</th><th class=r></th></tr>{rows}</table>'
+        f'<table><tr><th>trader</th><th>positions</th><th>his edge % · horizon</th><th class=r></th></tr>{rows}</table>'
         f'<form method=post action=/target style="display:flex;gap:8px;margin-top:10px">'
         f'<input name=addr class=in placeholder="paste a trader&#39;s 0x wallet address to start copying them" required '
         f'pattern="0x[0-9a-fA-F]{{40}}" title="a Polymarket wallet address: 0x followed by 40 hex characters">'
         f'<button class=go>▶ start copying</button></form>'
         f'<div class=dim style="margin-top:6px">adding baselines their past trades and copies from now on · '
-        f'removing stops new copies (open positions stay yours) · the scout finds candidates by the selection math</div></div>')
+        f'removing stops new copies (open positions stay yours) · per-trader edge sizes their copies by the Kelly rule '
+        f'(stronger measured edge ⇒ bigger stake) · the scout finds candidates by the selection math</div></div>')
 
 
 def _invest_card():
@@ -2007,6 +2041,20 @@ def scout_run():
             SCOUT["at"] = time.time()
 
 
+def scout_auto():
+    """Hands-off weekly re-screen (regimes end — e.g. the World Cup on Jul 19):
+    runs the same read-only pipeline, logs what PASSed into the history. It
+    NEVER auto-adds a trader — arming stays the owner's click in the panel."""
+    scout_run()
+    with LOCK:
+        passed = [r for r in SCOUT["rows"] if r.get("verdict") == "PASS"]
+    names = ", ".join(f'{str(r["name"])[:18]} ({r["net"][0]:+.0%} net)' for r in passed[:4])
+    logline(hist=True, kind="skip", side="SCOUT",
+            note=f"scheduled scout: {len(passed)} PASS — "
+                 + (names if passed else "nobody cleared the friction-adjusted bar")
+                 + " · review in the Scout panel (nothing is auto-added)")
+
+
 def _scout_card():
     with LOCK:
         s = {"running": SCOUT["running"], "note": SCOUT["note"], "rows": list(SCOUT["rows"])}
@@ -2021,10 +2069,14 @@ def _scout_card():
     for r in sorted(s["rows"], key=lambda r: -(r["net"][0] if r.get("net") else 9e9), reverse=False):
         net = f'{r["net"][0]:+.0%} … {r["net"][1]:+.0%}' if r.get("net") else "—"
         copying = r["addr"].lower() in cur
+        # a PASS row's button also arms per-trader sizing with the measured floor edge
+        edge_field = (f'<input type=hidden name=edge value="{r["net"][0] * 100:.1f}">'
+                      if r.get("verdict") == "PASS" and r.get("net") else "")
         act = ("<span class='tag dim'>copying ✓</span>" if copying else
                f'<form method=post action=/target style=margin:0>'
-               f'<input type=hidden name=addr value="{r["addr"]}">'
-               f'<button class=copy title="start copying — same as clicking copy on the leaderboard">copy</button></form>')
+               f'<input type=hidden name=addr value="{r["addr"]}">{edge_field}'
+               f'<button class=copy title="start copying — same as clicking copy on the leaderboard'
+               f'{"; sizes copies by the measured edge" if edge_field else ""}">copy</button></form>')
         rows += (f'<tr><td>{html.escape(str(r["name"]))[:20]}</td>'
                  f'<td class=r>${r["d30"]:,}</td><td class=r>${r.get("vol7", 0):,}</td>'
                  f'<td class=r>{r.get("od", "—")}</td><td class=r>{r.get("sell", "—")}%</td>'
@@ -2068,7 +2120,8 @@ def _settings_form():
     <option value=auto {"selected" if MODE == "auto" else ""}>auto — copy instantly</option>
     <option value=approve {"selected" if MODE == "approve" else ""}>approve — I click ✓ per trade</option>
   </select></label>
-  <label>Assumed net edge %<input name=edge_est value="{EDGE_EST:g}"> (per copy, after friction — sizing scales with it)</label>
+  <label>Assumed net edge %<input name=edge_est value="{EDGE_EST:g}"> (per copy, after friction — sizing scales with it; per-trader overrides live on the roster card)</label>
+  <label>Re-scout the leaderboard every <input name=scout_days value="{SCOUT_EVERY_DAYS:g}"> days (0 = manual button only — candidates are logged, never auto-added)</label>
   <label>Kelly multiple<input name=kelly_mult value="{KELLY_MULT:g}"> (0.5 = half-Kelly best practice; 1 = full; higher over-bets)</label>
   <label>Max $ / trade<input name=cap id=tcap value="{MAX_USDC_PER_TRADE}">
     <span id=tcapnote class=dim style="display:none">← auto-sized from wallet</span></label>
@@ -2427,13 +2480,32 @@ class Handler(BaseHTTPRequestHandler):
             if addr.startswith("0x") and len(addr) == 42:
                 if addr in TARGETS:
                     TARGETS.remove(addr)
+                    TEDGE.pop(addr.lower(), None)  # overrides die with the target
+                    TDAYS.pop(addr.lower(), None)
                     logline(kind="skip", note=f"dropped target {addr[:8]}…")
                 else:
                     TARGETS.append(addr)
                     with LOCK:
                         STATE["baselined"].discard(addr)
-                    logline(kind="skip", note=f"added target {addr[:8]}…")
+                    note = f"added target {addr[:8]}…"
+                    try:  # scout buttons carry the measured pessimistic edge — arm sizing with it
+                        TEDGE[addr.lower()] = float(f.get("edge", [""])[0])
+                        note += f" (measured edge {TEDGE[addr.lower()]:g}% → sizes its copies)"
+                    except ValueError:
+                        pass
+                    logline(kind="skip", note=note)
                 save_config()
+        elif path == "/tset":  # roster card: per-trader edge / horizon overrides
+            addr = f.get("addr", [""])[0].strip().lower()
+            if valid_addr(addr):
+                for field, d in (("edge", TEDGE), ("days", TDAYS)):
+                    try:
+                        d[addr] = float(f.get(field, [""])[0])
+                    except ValueError:
+                        d.pop(addr, None)  # blank = back to the global setting
+                save_config()
+                logline(kind="skip", note=f"per-trader overrides for {addr[:8]}…: "
+                        f"edge {TEDGE.get(addr, 'global')}% · horizon {TDAYS.get(addr, 'global')}d")
         elif path == "/settings":
             new_targets = parse_targets(f.get("target", [""])[0])
             for a in new_targets:
@@ -2454,6 +2526,7 @@ class Handler(BaseHTTPRequestHandler):
                 MODE = m
             globals()["EDGE_EST"] = num("edge_est", EDGE_EST)
             globals()["KELLY_MULT"] = num("kelly_mult", KELLY_MULT)
+            globals()["SCOUT_EVERY_DAYS"] = num("scout_days", SCOUT_EVERY_DAYS)
             MAX_USDC_PER_TRADE = num("cap", MAX_USDC_PER_TRADE)
             MIN_HIS_NOTIONAL = num("min_his", MIN_HIS_NOTIONAL)
             globals()["SPEND_CAP"] = num("spend_cap", SPEND_CAP)
@@ -2500,6 +2573,8 @@ def _check():
     assert my_buy_size(0.14, 1000, 50) == 29.07   # longshot sizes itself ~6× smaller
     assert my_buy_size(0.90, 1000, 5) == 5.56     # favorite wants 22.5% — the cap clips it
     assert my_buy_size(0.0) == 0.0 and my_buy_size(1.0) == 0.0  # degenerate prices never trade
+    assert my_buy_size(0.50, 1000, 999) == 50.0                 # global 5% assumed edge
+    assert my_buy_size(0.50, 1000, 999, edge=10.0) == 100.0     # per-trader edge scales linearly
     assert int(6666665 / 1e4) / 100.0 == 6.66         # chain balance floors to sellable shares
     assert limit_price(0.50, "BUY") == 0.51
     assert limit_price(0.50, "SELL") == 0.49
@@ -2588,6 +2663,25 @@ def _check():
         STATE["holdings"].pop(k, None)
         STATE["who"].pop(k, None)
 
+    # per-trader overrides: HIS horizon gates him, HIS measured edge sizes him,
+    # traders without an override keep the globals
+    pta, ptb = "0x" + "c" * 40, "0x" + "d" * 40
+    TDAYS[pta] = 1.0
+    globals()["market_end_ts"] = lambda tid: time.time() + 3 * 86400
+    handle({"asset": "pt1", "side": "BUY", "price": 0.5, "size": 1000, "title": "PT1",
+            "outcome": "Yes", "proxyWallet": pta.upper()})       # case-insensitive lookup
+    assert "this trader's 1d horizon" in STATE["log"][0]["note"] \
+        and STATE["holdings"].get("pt1") is None
+    handle({"asset": "pt2", "side": "BUY", "price": 0.5, "size": 1000, "title": "PT2", "outcome": "Yes"})
+    assert STATE["holdings"].get("pt2", 0) > 0                   # no override → global 0 = any horizon
+    TEDGE[ptb] = 20.0                                            # 4× the global 5% edge
+    handle({"asset": "pt3", "side": "BUY", "price": 0.5, "size": 1000, "title": "PT3",
+            "outcome": "Yes", "proxyWallet": ptb})
+    assert STATE["holdings"].get("pt3") == 6.0, STATE["holdings"].get("pt3")  # $30×10% Kelly = $3 → 6 sh (floor gave 2)
+    TDAYS.clear()
+    TEDGE.clear()
+    globals()["market_end_ts"] = lambda tid: time.time() + 3600
+
     # roster card: every target listed with a stop button + an add form; long
     # pseudonyms display-shortened everywhere (full name survives in tooltips)
     assert _short("RISK-IS-NEVER-OK") == "RISK-IS-NEVER-OK"
@@ -2596,9 +2690,12 @@ def _check():
     _ta = "0x" + "a" * 40
     TARGETS.append(_ta)
     STATE["tnames"][_ta] = "TestTrader"
+    TEDGE[_ta] = 7.5
     card = _roster_card()
     assert "TestTrader" in card and "start copying" in card and "✕ stop" in card
     assert card.count("action=/target") == 2  # one stop button + the add form
+    assert 'action=/tset' in card and 'value="7.5"' in card  # per-trader sizing editable in place
+    TEDGE.pop(_ta, None)
     TARGETS.remove(_ta)
     assert "no targets yet" in _roster_card()
 
@@ -2922,6 +3019,7 @@ def _check():
                       "short": 95, "net": (0.05, 0.2), "verdict": "PASS"}]
     card = _scout_card()
     assert "TestGuy" in card and "+5% … +20%" in card and "/target" in card and "PASS" in card
+    assert 'name=edge value="5.0"' in card  # PASS button arms sizing with the measured edge
     SCOUT["rows"] = []
 
     # the settings form must NEVER echo the stored key back into served HTML
