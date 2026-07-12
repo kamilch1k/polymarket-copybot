@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write   # the release step needs to create the release + upload binaries
+
 jobs:
   build:
     strategy:
