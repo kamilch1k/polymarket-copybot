@@ -49,6 +49,9 @@ SPEND_CAP = 15.0             # hard stop: total live BUY $ the bot may ever spen
 MAX_DAYS_OUT = 0.0           # only copy BUYs on markets ending within N days (0 = any horizon)
 MAX_LEGS_PER_EVENT = 2       # max open BUY legs per match/event (0 = uncapped) — same-match
                              # legs are near-perfectly correlated: m legs act as ONE bet at m× size
+INVESTED = 0.0               # owner's cost basis (set in Settings) — powers the My-investment panel
+BANK_PCT = 50.0              # % of every new-high profit locked out of the budget (0 = off):
+                             # banked money is never re-bet, so peaks survive the next drawdown
 AUTO_CAP_RESERVE = 8.0       # auto-budget: SPEND_CAP = wallet total − this reserve (0 = manual cap)
 AUTO_TRADE_PCT = 10.0        # auto-size: MAX_USDC_PER_TRADE = this % of wallet, $5 floor (0 = manual)
 MODE = "auto"                 # "auto" = copy instantly · "approve" = queue for your click
@@ -89,6 +92,8 @@ STATE = {
     "bought_at": {},             # token -> epoch of our buy (ghost-reconcile grace period)
     "missing_deps": [],          # runtime modules that failed to import at startup
     "who": {},                   # token -> trader we copied the open position from
+    "hwm": 0.0,                  # all-time-high wallet equity (cash + positions)
+    "banked": 0.0,               # profit locked at new highs — the cap never redeploys it
 }
 
 
@@ -230,6 +235,8 @@ def load_config():
     globals()["SPEND_CAP"] = c.get("spend_cap", SPEND_CAP)
     globals()["MAX_DAYS_OUT"] = c.get("max_days_out", MAX_DAYS_OUT)
     globals()["MAX_LEGS_PER_EVENT"] = int(c.get("max_legs_per_event", MAX_LEGS_PER_EVENT))
+    globals()["INVESTED"] = float(c.get("invested", INVESTED))
+    globals()["BANK_PCT"] = float(c.get("bank_pct", BANK_PCT))
     globals()["AUTO_CAP_RESERVE"] = c.get("auto_cap_reserve", AUTO_CAP_RESERVE)
     globals()["AUTO_TRADE_PCT"] = c.get("auto_trade_pct", AUTO_TRADE_PCT)
     STATE["funder"] = c.get("funder", "")
@@ -242,6 +249,7 @@ def save_config():
         "mode": MODE, "min_his": MIN_HIS_NOTIONAL, "sig_type": SIGNATURE_TYPE,
         "spend_cap": SPEND_CAP, "max_days_out": MAX_DAYS_OUT,
         "max_legs_per_event": MAX_LEGS_PER_EVENT,
+        "invested": INVESTED, "bank_pct": BANK_PCT,
         "auto_cap_reserve": AUTO_CAP_RESERVE, "auto_trade_pct": AUTO_TRADE_PCT,
         "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
@@ -258,6 +266,8 @@ def load_state():
     STATE["live_cost"] = s.get("live_cost", {})
     STATE["bought_at"] = s.get("bought_at", {})
     STATE["who"] = s.get("who", {})
+    STATE["hwm"] = s.get("hwm", 0.0)
+    STATE["banked"] = s.get("banked", 0.0)
     # backfill attribution for positions bought before the who-map existed:
     # BUY history entries have carried the trader name since day one
     bywho = {e.get("name"): e["who"] for e in STATE["history"]
@@ -274,7 +284,8 @@ def save_state():
         data = {"seen": sorted(STATE["seen"]), "holdings": STATE["holdings"],
                 "names": STATE["names"], "history": STATE["history"][-500:],
                 "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"],
-                "bought_at": STATE["bought_at"], "who": STATE["who"]}
+                "bought_at": STATE["bought_at"], "who": STATE["who"],
+                "hwm": STATE["hwm"], "banked": STATE["banked"]}
     STATE_FILE.write_text(json.dumps(data))
 
 
@@ -593,22 +604,51 @@ def reconcile_odometer():
     return released
 
 
+def bank_profits(total):
+    """New-high profit skim: when equity sets a high-water mark, lock BANK_PCT%
+    of the profit above the previous mark (and above cost basis) into 'banked' —
+    money the auto-cap treats as extra reserve and never redeploys. This is what
+    makes peaks survivable: rode-to-$88-back-to-$31 keeps a chunk, not a story.
+    Needs INVESTED set (else profit is undefined); the HWM tracks regardless."""
+    added = 0.0
+    with LOCK:
+        hwm = STATE["hwm"]
+        if total > hwm + 0.005:
+            base = max(hwm, INVESTED)
+            if BANK_PCT > 0 and INVESTED > 0 and total > base:
+                added = round((total - base) * BANK_PCT / 100, 2)
+                if added >= 0.01:
+                    STATE["banked"] = round(STATE["banked"] + added, 2)
+            STATE["hwm"] = round(total, 2)
+    if added >= 0.01:
+        logline(kind="live", note=f"profit banked: ${added:.2f} locked at new high ${total:.2f} "
+                                  f"(banked total ${STATE['banked']:.2f} — never re-bet)")
+        save_state()
+    return added
+
+
 def auto_cap():
-    """Wallet-driven sizing: SPEND_CAP = total − reserve, MAX_USDC_PER_TRADE = %
-    of total ($5 floor). Budgets then breathe with wins/losses, no manual bumps."""
+    """Wallet-driven sizing: SPEND_CAP = total − reserve − banked profit,
+    MAX_USDC_PER_TRADE = % of total ($5 floor). Budgets then breathe with
+    wins/losses, no manual bumps — and banked highs stay out of play."""
     if AUTO_CAP_RESERVE <= 0 and AUTO_TRADE_PCT <= 0:
         return
     with LOCK:
         w = dict(STATE["wallet"])
+        banked = STATE["banked"]
     cash = w.get("usdc")
     if cash is None:
         return  # chain read failed this cycle; keep the last values, don't jerk around
     total = cash + sum(float(p.get("currentValue") or 0) for p in w.get("positions", []))
+    bank_profits(total)
+    with LOCK:
+        banked = STATE["banked"]
     if AUTO_CAP_RESERVE > 0:
-        new = max(0.0, round(total - AUTO_CAP_RESERVE, 2))
+        new = max(0.0, round(total - AUTO_CAP_RESERVE - banked, 2))
         if abs(new - SPEND_CAP) >= 1.0:
+            bnote = f" − ${banked:g} banked" if banked else ""
             logline(kind="skip", note=f"auto-budget: cap ${SPEND_CAP:.2f} → ${new:.2f} "
-                                      f"(wallet ${total:.2f} − ${AUTO_CAP_RESERVE:g} reserve)")
+                                      f"(wallet ${total:.2f} − ${AUTO_CAP_RESERVE:g} reserve{bnote})")
         globals()["SPEND_CAP"] = new
     if AUTO_TRADE_PCT > 0:
         newc = max(5.0, round(total * AUTO_TRADE_PCT / 100, 2))
@@ -1631,6 +1671,34 @@ def _roster_card():
         f'removing stops new copies (open positions stay yours) · the scout finds candidates by the selection math</div></div>')
 
 
+def _invest_card():
+    """Your money at a glance: cost basis vs live equity, the all-time high, and
+    how much profit is banked (locked out of the budget, survives drawdowns)."""
+    with LOCK:
+        w = dict(STATE["wallet"])
+        hwm, banked = STATE["hwm"], STATE["banked"]
+    if INVESTED <= 0:
+        return ('<div class=card style=margin-bottom:16px><h2 style=margin-top:0>My investment</h2>'
+                '<div class=dim>set "I invested $" in Settings ⚙ and this panel tracks your return, '
+                'your all-time high, and banks a slice of every new high so profits survive drawdowns</div></div>')
+    cash = w.get("usdc")
+    if cash is None:
+        body = '<div class=dim>reading the chain…</div>'
+    else:
+        total = cash + sum(float(p.get("currentValue") or 0) for p in w.get("positions", []))
+        pnl = total - INVESTED
+        pct = pnl / INVESTED * 100
+        col = "#4ade80" if pnl >= 0 else "#f87171"
+        at_risk = max(0.0, total - banked)
+        body = (f'<div style=margin-bottom:4px>invested <b>${INVESTED:,.2f}</b> → now '
+                f'<b>${total:,.2f}</b> <span style=color:{col}>({pnl:+,.2f} · {pct:+.1f}%)</span> '
+                f'· all-time high ${hwm:,.2f}</div>'
+                f'<div class=dim>banked profit <b>${banked:,.2f}</b> (locked at new highs, never re-bet'
+                f'{f", {BANK_PCT:g}% of each new high" if BANK_PCT > 0 else " — banking off"}) · '
+                f'still in play ${at_risk:,.2f} · withdraw any time on polymarket.com — your wallet, your custody</div>')
+    return f'<div class=card style=margin-bottom:16px><h2 style=margin-top:0>My investment</h2>{body}</div>'
+
+
 def _status_card():
     """Am-I-actually-set-up panel: every prerequisite with its fix."""
     with LOCK:
@@ -1904,6 +1972,9 @@ def _settings_form():
     <span id=capnote class=dim style="display:none">← overridden while auto budget is on</span></label>
   <label>Only copy markets ending within <input name=max_days_out value="{MAX_DAYS_OUT:g}"> days (0 = any horizon; sells always follow)</label>
   <label>Max open legs per match/event <input name=max_legs_per_event value="{MAX_LEGS_PER_EVENT}"> (0 = uncapped — same-match legs are correlated: m legs ≈ one bet at m× size)</label>
+  <label>I invested $<input name=invested value="{INVESTED:g}"> (cost basis — powers the My-investment panel)</label>
+  <label>Bank <input name=bank_pct value="{BANK_PCT:g}">% of every new-high profit (0 = off; banked money is never re-bet)</label>
+  <label>Banked so far $<input name=banked value="{STATE['banked']:g}"> (grows automatically at new highs — lower it by hand after you withdraw)</label>
   <label><span style="display:flex;align-items:center;gap:6px"><input type=checkbox id=acr_on style="width:auto;margin:0">
     Auto budget — cap = wallet total minus this $ reserve (uncheck for manual cap)</span>
     <input name=auto_cap_reserve id=acr value="{AUTO_CAP_RESERVE:g}"></label>
@@ -2016,6 +2087,7 @@ def render_dyn():
 {errbar}
 {_chat_card()}
 {_status_card()}
+{_invest_card()}
 {_roster_card()}
 {_pending_card()}
 {_wallet_card()}
@@ -2263,6 +2335,11 @@ class Handler(BaseHTTPRequestHandler):
             globals()["SPEND_CAP"] = num("spend_cap", SPEND_CAP)
             globals()["MAX_DAYS_OUT"] = num("max_days_out", MAX_DAYS_OUT)
             globals()["MAX_LEGS_PER_EVENT"] = int(num("max_legs_per_event", MAX_LEGS_PER_EVENT))
+            globals()["INVESTED"] = num("invested", INVESTED)
+            globals()["BANK_PCT"] = num("bank_pct", BANK_PCT)
+            with LOCK:
+                STATE["banked"] = max(0.0, num("banked", STATE["banked"]))
+            save_state()
             globals()["AUTO_CAP_RESERVE"] = num("auto_cap_reserve", AUTO_CAP_RESERVE)
             globals()["AUTO_TRADE_PCT"] = num("auto_trade_pct", AUTO_TRADE_PCT)
             SLIPPAGE = num("slippage", SLIPPAGE)
@@ -2395,6 +2472,26 @@ def _check():
     assert card.count("action=/target") == 2  # one stop button + the add form
     TARGETS.remove(_ta)
     assert "no targets yet" in _roster_card()
+
+    # profit banking: a new high locks a slice of the profit above max(prev high, invested)
+    globals()["INVESTED"], globals()["BANK_PCT"] = 30.0, 50.0
+    STATE["hwm"], STATE["banked"] = 50.0, 0.0
+    bank_profits(88.0)
+    assert STATE["banked"] == 19.0 and STATE["hwm"] == 88.0
+    bank_profits(31.0)  # drawdown: the mark and the bank both hold
+    assert STATE["banked"] == 19.0 and STATE["hwm"] == 88.0
+    bank_profits(90.0)  # only the slice above the old mark banks
+    assert STATE["banked"] == 20.0 and STATE["hwm"] == 90.0
+    # invest card: full numbers when the basis is set, a setup nag when it isn't
+    STATE["wallet"] = {"usdc": 20.0, "positions": [{"currentValue": 11.47}]}
+    card = _invest_card()
+    assert "$31.47" in card and "+4.9%" in card and "$90.00" in card and "$20.00" in card
+    globals()["INVESTED"] = 0.0
+    assert "Settings" in _invest_card()
+    STATE["hwm"], STATE["banked"], STATE["wallet"] = 0.0, 0.0, {}
+    bank_profits(31.0)  # cost basis unset: the mark tracks, nothing banks
+    assert STATE["banked"] == 0.0 and STATE["hwm"] == 31.0
+    STATE["hwm"] = 0.0
     # resolution frees budget: live win credits, dry win doesn't, loss stays counted
     STATE["holdings"].update({"w1": 2.0, "w2": 3.0, "w3": 4.0})
     STATE["live_cost"] = {"w1": 1.0, "w3": 1.2}
@@ -2498,6 +2595,12 @@ def _check():
     auto_cap()
     assert SPEND_CAP == 45.0
     assert MAX_USDC_PER_TRADE == 5.3               # 10% of $53 wallet
+    STATE["banked"] = 10.0
+    auto_cap()
+    assert SPEND_CAP == 35.0                       # banked profit stays out of play
+    STATE["banked"], STATE["hwm"] = 0.0, 0.0
+    auto_cap()
+    assert SPEND_CAP == 45.0
     STATE["wallet"] = {"usdc": 20.0, "positions": []}
     auto_cap()
     assert MAX_USDC_PER_TRADE == 5.0               # small wallet -> $5 floor holds

@@ -641,6 +641,7 @@ someone's luck.
 - **Real-time copying** — WebSocket stream of platform trades (sub-second reaction), REST polling as reconciliation + fallback, per-trade dedupe across both paths
 - **Risk gates on every copy** — no stacking (one position per market regardless of how many fills the target sprays), no chasing (skips if the price ran past the target's fill + slippage), horizon cap (skip markets resolving beyond N days), failed-buy cooldown
 - **Auto-budget** — spend cap follows the wallet (total − reserve) and per-trade size scales with it, so the bot breathes with wins and losses without manual bumps
+- **Investment panel + profit banking** — set your cost basis and the dashboard shows live return vs invested and your all-time high; a configurable slice of every new-high profit is locked out of the budget (never re-bet), so peaks survive the next drawdown. Withdrawals stay on polymarket.com — your custody; the bot still contains zero transfer code
 - **Chain-level reconciliation** — detects zero-filled FAK orders and auto-swept resolved positions by reading balances and the Conditional Tokens payout vector straight from Polygon, so the ledger stays true even when every Polymarket API is blind (negRisk markets)
 - **Multi-trader with attribution** — every copy, skip and log line names which target it came from
 - **Built-in trader scout** — one click re-runs the whole selection pipeline against the live leaderboard and ranks candidates by friction-adjusted net copy edge, with per-row copy buttons; results stream in as each trader is analyzed
