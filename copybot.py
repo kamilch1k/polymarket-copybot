@@ -887,15 +887,23 @@ def _order(tid, side, shares, ref, name, drift=None, who=""):
                     pass
                 # FAK marketable limit: fill now or die, never rest at a stale price
                 signed = cl.create_order(OrderArgs(token_id=tid, price=price, size=shares, side="SELL"))
-            note = str(cl.post_order(signed, OrderType.FAK))[:80]
-            kind = "live"
-            with LOCK:  # cap tracks net $ in play: buys add, sell proceeds refund
-                delta = price * shares if side == "BUY" else -price * shares
-                STATE["spent_live"] = round(max(0.0, STATE["spent_live"] + delta), 2)
-                if side == "BUY":  # remember which holdings cost live money (for resolve credit)
-                    STATE["live_cost"][tid] = round(STATE["live_cost"].get(tid, 0.0) + price * shares, 2)
-                else:
-                    STATE["live_cost"].pop(tid, None)  # we always exit the whole position
+            resp = cl.post_order(signed, OrderType.FAK)
+            err = (resp.get("errorMsg") or "") if isinstance(resp, dict) else ""
+            if err:  # rejected without an exception: it's a failure, never count the spend
+                kind, note = "error", f"exchange rejected: {str(err)[:120]}"
+                if side == "BUY":
+                    FAILED_BUY_AT[tid] = time.time()
+            else:
+                oid = str(resp.get("orderID", "")) if isinstance(resp, dict) else ""
+                note = f"✓ order placed{' — ' + oid[:10] + '…' if oid else ''} @ {price}"
+                kind = "live"
+                with LOCK:  # cap tracks net $ in play: buys add, sell proceeds refund
+                    delta = price * shares if side == "BUY" else -price * shares
+                    STATE["spent_live"] = round(max(0.0, STATE["spent_live"] + delta), 2)
+                    if side == "BUY":  # remember which holdings cost live money (for resolve credit)
+                        STATE["live_cost"][tid] = round(STATE["live_cost"].get(tid, 0.0) + price * shares, 2)
+                    else:
+                        STATE["live_cost"].pop(tid, None)  # we always exit the whole position
         except Exception as ex:
             if "no orders found" in str(ex):  # FAK into a torn-down book: benign, no $ moved
                 kind, note = "skip", "book empty — FAK found nothing to match (market closing?)"
@@ -1571,6 +1579,13 @@ def _pending_card():
             f'<th class=r>size</th><th></th></tr>{rows}</table></div>')
 
 
+def _note(n):
+    """Older entries stored the exchange's raw response as the note — an empty
+    errorMsg in there means SUCCESS. Render those as what they were."""
+    n = str(n or "")
+    return "✓ order placed" if n.startswith("{'errorMsg': ''") else n
+
+
 def _history_rows():
     with LOCK:
         hist = list(STATE["history"])[-30:][::-1]
@@ -1580,7 +1595,7 @@ def _history_rows():
         out += (f'<tr><td class=dim>{e.get("d", "")} {e.get("t", "")}</td>'
                 f'<td style=color:{c}>{e.get("kind", "").upper()}</td><td>{e.get("side", "")}</td>'
                 f'<td>{_nw(e)}</td><td class=r>{e.get("shares", "")} @ {e.get("price", "")}</td>'
-                f'<td class=dim>{e.get("note", "")}</td></tr>')
+                f'<td class=dim>{_note(e.get("note", ""))}</td></tr>')
     return out or "<tr><td colspan=6 class=dim>no trades yet</td></tr>"
 
 
@@ -2148,7 +2163,7 @@ def render_dyn():
         px = f'@{e["price"]}' if "price" in e else ""
         lrows += (f'<tr><td class=dim>{e["t"]}</td><td style=color:{c}>{e.get("kind", "").upper()}</td>'
                   f'<td>{e.get("side", "")}</td><td>{_nw(e)}</td>'
-                  f'<td class=r>{e.get("shares", "")} {px}</td><td class=dim>{e.get("note", "")}</td></tr>')
+                  f'<td class=r>{e.get("shares", "")} {px}</td><td class=dim>{_note(e.get("note", ""))}</td></tr>')
     lrows = lrows or "<tr><td colspan=6 class=dim>waiting…</td></tr>"
     stats = "".join(f"<li>{s}</li>" for s in copy_stats(feed))
     errbar = f'<div class=err>{err}</div>' if err else ""
@@ -2743,6 +2758,30 @@ def _check():
     globals()["get_client"] = _ogc
     FAILED_BUY_AT.clear()
     STATE["spent_live"] = 0.0
+
+    # exchange responses: a non-empty errorMsg is a FAILURE (no spend counted, cooldown
+    # set); a clean response renders human, not as a raw dict; legacy notes prettify
+    class _FakeCl:
+        resp = {"errorMsg": "not enough balance / market closed", "orderID": ""}
+        def create_market_order(self, a): return "signed"
+        def create_order(self, a): return "signed"
+        def update_balance_allowance(self, p): return None
+        def get_balance_allowance(self, p): return {"balance": "0"}
+        def post_order(self, s, t): return dict(_FakeCl.resp)
+    globals()["get_client"] = lambda: _FakeCl()
+    STATE["live"], STATE["spent_live"], globals()["SPEND_CAP"] = True, 0.0, 50.0
+    assert _order("em1", "BUY", 2.0, 0.5, "EM — Yes") is False
+    assert "exchange rejected" in STATE["log"][0]["note"] and STATE["spent_live"] == 0.0
+    assert "em1" in FAILED_BUY_AT and "em1" not in STATE["live_cost"]
+    _FakeCl.resp = {"errorMsg": "", "orderID": "0xabcdef123456"}
+    assert _order("em2", "BUY", 2.0, 0.5, "EM2 — Yes") is True
+    assert "✓ order placed — 0xabcdef12…" in STATE["log"][0]["note"] and STATE["spent_live"] > 0
+    assert _note("{'errorMsg': '', 'orderID': '0xf161...'}") == "✓ order placed"
+    assert _note("resolved WON — freed") == "resolved WON — freed"  # real notes untouched
+    STATE["live"], STATE["spent_live"] = False, 0.0
+    STATE["live_cost"].pop("em2", None)
+    globals()["get_client"] = _ogc
+    FAILED_BUY_AT.clear()
     # auto budget: cap follows wallet total minus reserve; 0 disables it
     STATE["wallet"] = {"usdc": 50.0, "positions": [{"currentValue": 3.0}]}
     globals()["AUTO_CAP_RESERVE"], globals()["AUTO_TRADE_PCT"] = 8.0, 10.0
