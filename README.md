@@ -270,15 +270,27 @@ add had to clear two screens the headline number can't fake:
 Selection finds edge; execution keeps it. Each mirrored BUY at target price
 p_T and target share count q_T, with wallet total W:
 
-**Sizing** (flat, bankroll-scaled — a bounded stand-in for fractional Kelly,
-since per-trade μ and σ are unknowable for someone else's signal; Kelly's
-optimal fraction μ/σ² cannot be estimated, so the bot bounds the fraction
-instead of pretending to know it):
+**Sizing — price-aware fractional Kelly** (upgraded mid-run, once the
+distributional analysis below produced a usable κ\*; the first week traded a
+flat clip). A binary bought at price p has per-dollar variance
+σ²(p) = (1−p)/p, so for an assumed net per-copy edge ê the Kelly-optimal
+fraction is price-dependent, and the bot bets a deliberate fraction k of it
+on **at-play** equity (wallet minus banked profit):
 
 ```math
-\text{notional} \;=\; \mathrm{clip}\!\big(\phi\, q_T\, p_T,\;\; 1,\;\; C\big),
-\qquad C=\max(5,\;0.10\,W)\ \ \text{USD}
+f^{*}(p)\;=\;\frac{\hat e}{\sigma^2(p)}\;=\;\hat e\,\frac{p}{1-p},
+\qquad
+\text{notional}\;=\;\mathrm{clip}\!\Big(k\,f^{*}(p)\,(W-B),\;\;1,\;\;\max\big(5,\;0.10\,(W-B)\big)\Big)
 ```
+
+k = ½ (half-Kelly) by default: the edge estimate carries error, over-betting
+an over-estimate costs growth quadratically (the volatility-drag term), and
+half-Kelly buys ~75% of the growth at half the variance. Consequences the
+flat clip didn't have: **longshots size themselves down** (a 14¢ ticket gets
+~⅙ the notional of an even-odds bet — the Egypt-longshot class shrinks
+automatically), favorites size up but stay capped, banked profit is invisible
+to sizing exactly as it is to the budget, and the last dollars of budget
+headroom now fill as a clipped copy instead of being skipped outright.
 
 **No-chase gate** — copy only while the price hasn't outrun the signal. This
 inequality is why measured drift stays ≤ +1pp: lag cost is capped by
@@ -404,11 +416,14 @@ g(\kappa)=w\ln(1+\kappa a)+(1-w)\ln(1-\kappa)\;\approx\;\kappa\mu-\tfrac12\kappa
 \qquad \kappa^{*}_{\text{Kelly}}=\frac{\mu}{\sigma^2}\approx 5.6\%
 ```
 
-The bot's realized κ ≈ 7% is ≈ 1.24× Kelly at the point estimates — mildly
-aggressive (it burns ~7% of the theoretical growth rate; g/day 0.0069 vs
-0.0074 at κ\*). The sharper warning cuts the other way: if the true edge sits
-in the lower half of the CI, the *same* sizing is deep over-Kelly, where
-expected log-growth is negative even with a positive-EV coin.
+The bot's week-one realized κ ≈ 7% was ≈ 1.24× Kelly at the point estimates —
+mildly aggressive (it burned ~7% of the theoretical growth rate; g/day 0.0069
+vs 0.0074 at κ\*). The sharper warning cuts the other way: if the true edge
+sits in the lower half of the CI, the *same* sizing is deep over-Kelly, where
+expected log-growth is negative even with a positive-EV coin. **This analysis
+has since been folded back into the bot**: sizing now bets k·ê·p/(1−p) with
+k = ½ by default (see the execution math above) — the page's own derivation
+became the sizing engine.
 
 ### Correlation makes the variance bigger than it looks
 

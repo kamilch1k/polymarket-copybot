@@ -39,8 +39,10 @@ import requests
 
 # ---- config (defaults; editable live in the web UI) -------------------------
 TARGETS = []                  # proxy wallets to copy — set in the page, several OK
-BANKROLL = 30.0               # your total stake, for sizing hints only
-COPY_FRACTION = 0.01          # copy 1% of his share size
+BANKROLL = 30.0               # sizing fallback until the chain has been read once
+EDGE_EST = 5.0                # assumed net edge per copy, % after friction — sizing scales with it
+KELLY_MULT = 0.5              # fraction of full Kelly to bet (½ = best practice: estimation
+                              # error makes full Kelly an over-bet half the time)
 MAX_USDC_PER_TRADE = 5.0      # per-copy notional cap
 MIN_NOTIONAL = 1.0            # Polymarket rejects orders under ~$1
 SLIPPAGE = 0.02              # accept up to this much worse than his fill
@@ -122,15 +124,32 @@ def check_deps(log=True):
 
 
 # ---- pure logic (unit-tested in _check) -------------------------------------
-def my_buy_size(his_size, price, fraction=None, cap=None):
-    """Shares to buy to mirror his_size at `price`, floored at the $1 exchange
-    minimum: every buy of his gets copied — same market beats same size.
-    Defaults read the live globals so UI edits take effect immediately."""
-    if price <= 0:
+def bankroll_at_play():
+    """Sizing base: wallet equity minus banked profit — banked money is out of
+    the game for sizing exactly as it is for the budget cap. Falls back to the
+    manual BANKROLL setting while the chain hasn't been read yet."""
+    with LOCK:
+        w = dict(STATE["wallet"])
+        banked = STATE["banked"]
+    cash = w.get("usdc")
+    if cash is None:
+        return max(0.0, BANKROLL - banked)
+    total = cash + sum(float(p.get("currentValue") or 0) for p in w.get("positions", []))
+    return max(0.0, total - banked)
+
+
+def my_buy_size(price, bankroll=None, cap=None):
+    """Fractional-Kelly sizing, price-aware. A binary bought at price p has
+    per-dollar variance (1-p)/p, so for an assumed net edge e the Kelly
+    fraction is f* = e·p/(1-p) — longshots size themselves down, favorites up.
+    We bet KELLY_MULT of f* (half-Kelly default) on at-play equity, clipped to
+    [$1 exchange minimum, per-trade cap]. Same market always beats same size."""
+    if price <= 0 or price >= 1:
         return 0.0
-    fraction = COPY_FRACTION if fraction is None else fraction
+    b = bankroll_at_play() if bankroll is None else bankroll
     cap = MAX_USDC_PER_TRADE if cap is None else cap
-    notional = min(max(his_size * price * fraction, MIN_NOTIONAL), cap)
+    f = KELLY_MULT * (EDGE_EST / 100.0) * price / (1.0 - price)
+    notional = min(max(b * f, MIN_NOTIONAL), cap)
     return round(notional / price, 2)
 
 
@@ -166,21 +185,15 @@ def copy_stats(feed):
     notionals = [float(t["size"]) * float(t["price"]) for t in trades]
     avg = sum(notionals) / len(notionals)
     buys = sum(1 for t in trades if t["side"].upper() == "BUY")
-    per_copy = min(max(avg * COPY_FRACTION, MIN_NOTIONAL), MAX_USDC_PER_TRADE)
+    per_copy = min(max(bankroll_at_play() * KELLY_MULT * EDGE_EST / 100.0, MIN_NOTIONAL),
+                   MAX_USDC_PER_TRADE)
     lines = [
         f"his last {len(trades)} trades: {buys} buys / {len(trades) - buys} sells",
         f"his avg trade ≈ ${avg:,.0f}",
-        f"you copy {COPY_FRACTION * 100:.1f}% (min ${MIN_NOTIONAL:.0f}, cap ${MAX_USDC_PER_TRADE:.0f}) → ≈ ${per_copy:.2f}/copy",
+        f"you size by fractional Kelly (edge {EDGE_EST:g}% × {KELLY_MULT:g}) → "
+        f"≈ ${per_copy:.2f} at even odds; longshots smaller, favorites larger, cap ${MAX_USDC_PER_TRADE:.0f}",
         f"budget ${SPEND_CAP:.0f} → room for ~{int(SPEND_CAP / max(per_copy, 0.01))} concurrent copies",
     ]
-    if avg * COPY_FRACTION > MAX_USDC_PER_TRADE:
-        lines.append("⚠ his size is big — your $ cap binds, so copies are flat, not proportional. "
-                     "Raise the cap or drop the fraction to track him faithfully.")
-    elif avg * COPY_FRACTION < MIN_NOTIONAL:
-        lines.append(f"✓ his clips are small — every buy copies at the ${MIN_NOTIONAL:.0f} "
-                     "exchange minimum (flat sizing, same markets)")
-    else:
-        lines.append("✓ cap rarely binds — copies scale with his size. Faithful tracking.")
     with LOCK:
         drifts = [e["drift"] for e in STATE["history"] if e.get("drift") is not None]
     if drifts:
@@ -220,7 +233,7 @@ def key_wallet(k):
 
 # ---- persistence ------------------------------------------------------------
 def load_config():
-    global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, MODE, \
+    global TARGETS, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, MODE, \
         PRIVATE_KEY_MEM, MIN_HIS_NOTIONAL, SIGNATURE_TYPE
     if not CONFIG_FILE.exists():
         return
@@ -230,7 +243,8 @@ def load_config():
         PRIVATE_KEY_MEM = c["private_key"]
         STATE["pk_set"] = True
     MODE = c.get("mode", MODE)
-    COPY_FRACTION = c.get("fraction", COPY_FRACTION)
+    globals()["EDGE_EST"] = float(c.get("edge_est", EDGE_EST))
+    globals()["KELLY_MULT"] = float(c.get("kelly_mult", KELLY_MULT))
     MAX_USDC_PER_TRADE = c.get("cap", MAX_USDC_PER_TRADE)
     SLIPPAGE = c.get("slippage", SLIPPAGE)
     BANKROLL = c.get("bankroll", BANKROLL)
@@ -249,7 +263,8 @@ def load_config():
 
 def save_config():
     CONFIG_FILE.write_text(json.dumps({  # includes the key: owner's choice, file is gitignored
-        "targets": TARGETS, "funder": STATE.get("funder", ""), "fraction": COPY_FRACTION,
+        "targets": TARGETS, "funder": STATE.get("funder", ""),
+        "edge_est": EDGE_EST, "kelly_mult": KELLY_MULT,
         "cap": MAX_USDC_PER_TRADE, "slippage": SLIPPAGE, "bankroll": BANKROLL,
         "mode": MODE, "min_his": MIN_HIS_NOTIONAL, "sig_type": SIGNATURE_TYPE,
         "spend_cap": SPEND_CAP, "max_days_out": MAX_DAYS_OUT,
@@ -662,10 +677,11 @@ def auto_cap():
                                       f"(wallet ${total:.2f} − ${AUTO_CAP_RESERVE:g} reserve{bnote})")
         globals()["SPEND_CAP"] = new
     if AUTO_TRADE_PCT > 0:
-        newc = max(5.0, round(total * AUTO_TRADE_PCT / 100, 2))
+        at_play = max(0.0, total - banked)
+        newc = max(5.0, round(at_play * AUTO_TRADE_PCT / 100, 2))
         if abs(newc - MAX_USDC_PER_TRADE) >= 0.5:
             logline(kind="skip", note=f"auto-size: per-trade cap ${MAX_USDC_PER_TRADE:.2f} → ${newc:.2f} "
-                                      f"({AUTO_TRADE_PCT:g}% of ${total:.2f} wallet)")
+                                      f"({AUTO_TRADE_PCT:g}% of ${at_play:.2f} at-play)")
         globals()["MAX_USDC_PER_TRADE"] = newc
 
 
@@ -817,10 +833,20 @@ def _order(tid, side, shares, ref, name, drift=None, who=""):
     with LOCK:
         live = STATE["live"]
         STATE["copies"] += 1
-    if live and side == "BUY" and over_budget(price * shares):
-        logline(kind="skip", side="BUY", name=name,
-                note=f"HARD STOP: ${STATE['spent_live']:.2f} of ${SPEND_CAP:.2f} budget spent")
-        return False
+    if live and side == "BUY":
+        with LOCK:
+            headroom = round(SPEND_CAP - STATE["spent_live"], 2)
+        want = round(price * shares, 2)
+        if want > headroom + 1e-9:
+            if headroom >= MIN_NOTIONAL:
+                # deploy the last budget dollars as a clipped copy instead of skipping
+                shares = round(headroom / price, 2)
+                logline(kind="skip", side="BUY", name=name,
+                        note=f"budget clip: ${want:.2f} → ${headroom:.2f} to fit the ${SPEND_CAP:.2f} cap")
+            else:
+                logline(kind="skip", side="BUY", name=name,
+                        note=f"HARD STOP: ${STATE['spent_live']:.2f} of ${SPEND_CAP:.2f} budget spent")
+                return False
     kind, note = "dry", ""
     if live:
         from py_clob_client_v2.clob_types import (OrderArgs, MarketOrderArgs, OrderType,
@@ -983,7 +1009,7 @@ def handle(trade):
                             note=f"per-match cap: {legs} leg(s) already open on this event — "
                                  f"correlated legs act as one bet at {legs + 1}× size")
                     return
-            shares = my_buy_size(his, price)
+            shares = my_buy_size(price)
             if shares <= 0:
                 logline(kind="skip", side="BUY", name=name, who=who, note="unpriced trade")
                 return
@@ -1168,7 +1194,8 @@ def bot_context():
         ctx = {
             "live_trading": STATE["live"], "mode": MODE, "ws_realtime": STATE["ws"],
             "targets": [{"addr": a, "name": STATE["tnames"].get(a, "?")} for a in TARGETS],
-            "settings": {"copy_fraction": COPY_FRACTION, "max_usd_per_trade": MAX_USDC_PER_TRADE,
+            "settings": {"edge_est_pct": EDGE_EST, "kelly_mult": KELLY_MULT,
+                         "max_usd_per_trade": MAX_USDC_PER_TRADE,
                          "min_his_buy_usd": MIN_HIS_NOTIONAL, "slippage": SLIPPAGE,
                          "bankroll_usd": BANKROLL},
             "bot_holdings": holdings,
@@ -1183,7 +1210,7 @@ def bot_context():
     return ctx
 
 
-ALLOWED_OPS = ("live", "mode", "fraction", "cap", "min_his", "slippage",
+ALLOWED_OPS = ("live", "mode", "edge", "kelly", "cap", "min_his", "slippage",
                "bankroll", "add_target", "drop_target")
 
 
@@ -1203,7 +1230,7 @@ def parse_actions(text):
 
 def apply_actions(acts):
     """Whitelisted bot controls Claude may invoke when the owner asks for a change."""
-    global MODE, COPY_FRACTION, MAX_USDC_PER_TRADE, MIN_HIS_NOTIONAL, SLIPPAGE, BANKROLL
+    global MODE, MAX_USDC_PER_TRADE, MIN_HIS_NOTIONAL, SLIPPAGE, BANKROLL
     applied = []
     for a in acts[:6]:
         if not isinstance(a, dict) or a.get("op") not in ALLOWED_OPS:
@@ -1223,8 +1250,10 @@ def apply_actions(acts):
                 applied.append(f"mode={v}")
             elif op in ("fraction", "cap", "min_his", "slippage", "bankroll"):
                 v = float(v)
-                if op == "fraction":
-                    COPY_FRACTION = v
+                if op == "edge":
+                    globals()["EDGE_EST"] = v
+                elif op == "kelly":
+                    globals()["KELLY_MULT"] = v
                 elif op == "cap":
                     MAX_USDC_PER_TRADE = v
                 elif op == "min_his":
@@ -1982,7 +2011,8 @@ def _settings_form():
     <option value=auto {"selected" if MODE == "auto" else ""}>auto — copy instantly</option>
     <option value=approve {"selected" if MODE == "approve" else ""}>approve — I click ✓ per trade</option>
   </select></label>
-  <label>Copy fraction<input name=fraction value="{COPY_FRACTION}"></label>
+  <label>Assumed net edge %<input name=edge_est value="{EDGE_EST:g}"> (per copy, after friction — sizing scales with it)</label>
+  <label>Kelly multiple<input name=kelly_mult value="{KELLY_MULT:g}"> (0.5 = half-Kelly best practice; 1 = full; higher over-bets)</label>
   <label>Max $ / trade<input name=cap id=tcap value="{MAX_USDC_PER_TRADE}">
     <span id=tcapnote class=dim style="display:none">← auto-sized from wallet</span></label>
   <label>Copy his BUY only if ≥ $<input name=min_his value="{MIN_HIS_NOTIONAL}"></label>
@@ -2233,7 +2263,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, render())
 
     def do_POST(self):
-        global TARGETS, COPY_FRACTION, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, \
+        global TARGETS, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, \
             PRIVATE_KEY_MEM, MODE, CLIENT, MIN_HIS_NOTIONAL
         path = urlparse(self.path).path
         body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)).decode()
@@ -2348,7 +2378,8 @@ class Handler(BaseHTTPRequestHandler):
             m = f.get("mode", [""])[0]
             if m in ("auto", "approve"):
                 MODE = m
-            COPY_FRACTION = num("fraction", COPY_FRACTION)
+            globals()["EDGE_EST"] = num("edge_est", EDGE_EST)
+            globals()["KELLY_MULT"] = num("kelly_mult", KELLY_MULT)
             MAX_USDC_PER_TRADE = num("cap", MAX_USDC_PER_TRADE)
             MIN_HIS_NOTIONAL = num("min_his", MIN_HIS_NOTIONAL)
             globals()["SPEND_CAP"] = num("spend_cap", SPEND_CAP)
@@ -2386,11 +2417,13 @@ def _check():
     globals()["CHAT_FILE"] = Path(os.environ.get("TEMP", ".")) / "copybot_check_chat.jsonl"
     globals()["midpoint"] = lambda tid: None  # offline: no live mid / tick lookups
     globals()["tick_of"] = lambda tid: 0.01
-    assert my_buy_size(1000, 0.50, 0.01, 50) == 10.0
-    assert my_buy_size(1000, 0.50, 0.01, 3) == 6.0
-    assert my_buy_size(10, 0.50, 0.01, 50) == 2.0     # tiny clip floors to $1 min
-    assert my_buy_size(272, 0.2925, 0.01, 5) == 3.42  # his real median-size clip → $1 copy
-    assert my_buy_size(100, 0.0, 0.01, 5) == 0.0      # unpriced trade never divides by zero
+    # fractional-Kelly sizing: f = k·ê·p/(1−p) on at-play bankroll, clipped to [$1, cap]
+    assert my_buy_size(0.50, 1000, 50) == 50.0    # 2.5% of $1000 = $25 → 50 shares
+    assert my_buy_size(0.50, 1000, 10) == 20.0    # per-trade cap binds
+    assert my_buy_size(0.50, 10, 50) == 2.0       # tiny bankroll floors to the $1 minimum
+    assert my_buy_size(0.14, 1000, 50) == 29.07   # longshot sizes itself ~6× smaller
+    assert my_buy_size(0.90, 1000, 5) == 5.56     # favorite wants 22.5% — the cap clips it
+    assert my_buy_size(0.0) == 0.0 and my_buy_size(1.0) == 0.0  # degenerate prices never trade
     assert int(6666665 / 1e4) / 100.0 == 6.66         # chain balance floors to sellable shares
     assert limit_price(0.50, "BUY") == 0.51
     assert limit_price(0.50, "SELL") == 0.49
@@ -2410,7 +2443,7 @@ def _check():
     handle({"asset": "t2", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q2", "outcome": "No"})
     assert len(STATE["pending"]) == 1 and STATE["holdings"].get("t2") is None
     execute(STATE["pending"].popitem()[1])
-    assert STATE["holdings"]["t2"] == 10.0
+    assert STATE["holdings"]["t2"] == 2.0  # $1 floor at the $30 fallback bankroll → 2 shares
     MODE = "auto"
     # conviction floor (pinned for the test): his $25 buy is below a $50 floor -> skipped
     globals()["MIN_HIS_NOTIONAL"] = 50.0
@@ -2435,12 +2468,12 @@ def _check():
     globals()["market_end_ts"] = lambda tid: time.time() + 3600
     handle({"asset": "t7", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q7",
             "outcome": "Yes", "_who": "guyX"})
-    assert STATE["holdings"].get("t7") == 10.0
+    assert STATE["holdings"].get("t7") == 2.0  # Kelly floor at the $30 fallback bankroll
     assert STATE["history"][-1].get("who") == "guyX"   # copies say which trader triggered them
     assert "guyX" in render_dyn()
     # burst fills don't stack: second buy on an already-held market is skipped
     handle({"asset": "t7", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q7", "outcome": "Yes"})
-    assert "not stacking" in STATE["log"][0]["note"] and STATE["holdings"]["t7"] == 10.0
+    assert "not stacking" in STATE["log"][0]["note"] and STATE["holdings"]["t7"] == 2.0
     assert "t7" not in INFLIGHT_BUYS  # marker released after the copy landed
     # race guard: a concurrent in-flight copy of the same market blocks the second thread
     INFLIGHT_BUYS.add("t8")
@@ -2614,6 +2647,20 @@ def _check():
     # hard spend cap arithmetic
     STATE["spent_live"], globals()["SPEND_CAP"] = 19.50, 20.0
     assert not over_budget(0.49) and over_budget(0.51)
+    # partial headroom clips the copy to fit; dust headroom still hard-stops
+    _ogc = get_client
+    globals()["get_client"] = lambda: (_ for _ in ()).throw(RuntimeError("offline"))
+    STATE["live"], STATE["spent_live"] = True, 8.0
+    _order("bh1", "BUY", 20.0, 0.5, "BH — Yes")   # wants ~$10.2, headroom $12 - fits? no: cap 20, spent 8
+    STATE["spent_live"] = 18.5
+    _order("bh2", "BUY", 20.0, 0.5, "BH2 — Yes")  # wants ~$10.2, headroom $1.50 → clipped
+    assert any("budget clip" in (e.get("note") or "") for e in list(STATE["log"])[:3])
+    STATE["spent_live"] = 19.8
+    _order("bh3", "BUY", 20.0, 0.5, "BH3 — Yes")  # headroom $0.20 < $1 minimum → hard stop
+    assert "HARD STOP" in STATE["log"][0]["note"]
+    STATE["live"] = False
+    globals()["get_client"] = _ogc
+    FAILED_BUY_AT.clear()
     STATE["spent_live"] = 0.0
     # auto budget: cap follows wallet total minus reserve; 0 disables it
     STATE["wallet"] = {"usdc": 50.0, "positions": [{"currentValue": 3.0}]}
