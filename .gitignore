@@ -3,3 +3,6 @@ copybot_state.json
 copybot_chat.jsonl
 copybot_preview.html
 __pycache__/
+dist/
+build/
+*.spec
