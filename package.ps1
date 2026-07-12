@@ -9,7 +9,8 @@ python -m pip install --quiet --upgrade pyinstaller
 $flags = @("--noconfirm", "--onefile", "--name", "Copybot",
            "--collect-all", "py_clob_client_v2", "--collect-all", "eth_account",
            "--collect-all", "eth_utils", "--collect-all", "websocket",
-           "--collect-all", "webview", "--collect-all", "regex")
+           "--collect-all", "webview", "--collect-all", "regex",
+           "--collect-all", "keyring")
 if (-not $Console) { $flags += "--windowed" }
 python -m PyInstaller @flags copybot.py
 

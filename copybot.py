@@ -9,9 +9,11 @@ activity + how to copy him best, and a leaderboard of traders to one-click copy.
 
 Localhost-only on purpose: the page has a live-trade switch and a kill button.
 
-Everything — targets, funder, sizing, AND the private key — persists to
-copybot_config.json next to this file. That file is gitignored (never pushed);
-it is plaintext on this PC, by the owner's choice. Configure once, runs forever.
+Everything — targets, funder, sizing — persists to copybot_config.json next to
+this file (gitignored, never pushed). The private key lives in the OS credential
+vault (Windows Credential Manager / macOS Keychain / Secret Service) with a
+verified write; only a box with no vault at all falls back to the plaintext
+config, by the owner's choice. Configure once, runs forever.
 
 SETUP
   pip install py-clob-client-v2 requests websocket-client
@@ -108,6 +110,7 @@ STATE = {
     "missing_deps": [],          # runtime modules that failed to import at startup
     "who": {},                   # token -> trader we copied the open position from
     "last_scout": 0.0,           # when the weekly auto-scout last ran (persisted across restarts)
+    "dep_block": 0,              # deposit watcher's chain cursor (last scanned Polygon block)
     "hwm": 0.0,                  # all-time-high wallet equity (cash + positions) — display truth
     "banked": 0.0,               # profit locked at new highs — the cap never redeploys it
     "bank_base": 0.0,            # level up to which profit has been banked (≠ hwm: small gains
@@ -246,6 +249,26 @@ def key_wallet(k):
 
 
 # ---- persistence ------------------------------------------------------------
+def _vault_save(k):
+    """Store the key in the OS credential vault (Windows Credential Manager /
+    macOS Keychain / Secret Service). True only on a verified read-back — a
+    False means no usable vault and the caller keeps the plaintext fallback."""
+    try:
+        import keyring
+        keyring.set_password("copybot", "private_key", k)
+        return keyring.get_password("copybot", "private_key") == k
+    except Exception:
+        return False
+
+
+def _vault_load():
+    try:
+        import keyring
+        return keyring.get_password("copybot", "private_key") or ""
+    except Exception:  # no vault (lib missing, headless box): config fallback
+        return ""
+
+
 def load_config():
     global TARGETS, MAX_USDC_PER_TRADE, SLIPPAGE, BANKROLL, MODE, \
         PRIVATE_KEY_MEM, MIN_HIS_NOTIONAL, SIGNATURE_TYPE
@@ -253,8 +276,11 @@ def load_config():
         return
     c = json.loads(CONFIG_FILE.read_text())
     TARGETS = c.get("targets") or ([c["target"]] if c.get("target") else [])
-    if c.get("private_key"):
-        PRIVATE_KEY_MEM = c["private_key"]
+    k = c.get("private_key") or ""
+    migrated = bool(k) and _vault_save(k)  # move plaintext into the vault, verified
+    k = k or _vault_load()
+    if k:
+        PRIVATE_KEY_MEM = k
         STATE["pk_set"] = True
     MODE = c.get("mode", MODE)
     globals()["EDGE_EST"] = float(c.get("edge_est", EDGE_EST))
@@ -278,10 +304,17 @@ def load_config():
     globals()["AUTO_CAP_RESERVE"] = c.get("auto_cap_reserve", AUTO_CAP_RESERVE)
     globals()["AUTO_TRADE_PCT"] = c.get("auto_trade_pct", AUTO_TRADE_PCT)
     STATE["funder"] = c.get("funder", "")
+    if migrated:  # rewrite the file immediately so the plaintext key is gone from disk
+        save_config()
+        logline(kind="live", note="private key moved into the OS credential vault — "
+                                  "no longer stored in copybot_config.json")
 
 
 def save_config():
-    CONFIG_FILE.write_text(json.dumps({  # includes the key: owner's choice, file is gitignored
+    # key goes to the OS vault when one exists; plaintext in the gitignored file
+    # only as the fallback (headless boxes without a vault) — owner's choice
+    pk_out = "" if (PRIVATE_KEY_MEM and _vault_save(PRIVATE_KEY_MEM)) else (PRIVATE_KEY_MEM or "")
+    CONFIG_FILE.write_text(json.dumps({
         "targets": TARGETS, "funder": STATE.get("funder", ""),
         "edge_est": EDGE_EST, "kelly_mult": KELLY_MULT,
         "tedge": TEDGE, "tdays": TDAYS, "scout_days": SCOUT_EVERY_DAYS,
@@ -292,7 +325,7 @@ def save_config():
         "invested": INVESTED, "bank_pct": BANK_PCT, "bank_hurdle_pct": BANK_HURDLE_PCT,
         "tp_price": TP_PRICE, "tp_gain_pct": TP_GAIN_PCT,
         "auto_cap_reserve": AUTO_CAP_RESERVE, "auto_trade_pct": AUTO_TRADE_PCT,
-        "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
+        "private_key": pk_out}, indent=2))
 
 
 def load_state():
@@ -308,6 +341,7 @@ def load_state():
     STATE["bought_at"] = s.get("bought_at", {})
     STATE["who"] = s.get("who", {})
     STATE["last_scout"] = s.get("last_scout", 0.0)
+    STATE["dep_block"] = s.get("dep_block", 0)
     STATE["hwm"] = s.get("hwm", 0.0)
     STATE["banked"] = s.get("banked", 0.0)
     STATE["bank_base"] = s.get("bank_base", 0.0)
@@ -328,7 +362,7 @@ def save_state():
                 "names": STATE["names"], "history": STATE["history"][-500:],
                 "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"],
                 "bought_at": STATE["bought_at"], "who": STATE["who"],
-                "last_scout": STATE["last_scout"],
+                "last_scout": STATE["last_scout"], "dep_block": STATE["dep_block"],
                 "hwm": STATE["hwm"], "banked": STATE["banked"], "bank_base": STATE["bank_base"]}
     STATE_FILE.write_text(json.dumps(data))
 
@@ -438,17 +472,69 @@ def tick_of(tid):
     return TICKS[tid]
 
 
-def _erc20_balance(token, addr):
-    data = "0x70a08231" + addr[2:].lower().rjust(64, "0")  # balanceOf(addr)
+def _rpc(method, params):
+    """Read-only Polygon JSON-RPC with fallback across public nodes. None on failure."""
     for rpc in POLYGON_RPCS:
         try:
-            r = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                              "params": [{"to": token, "data": data}, "latest"]}, timeout=8).json()
-            if r.get("result"):
-                return int(r["result"], 16) / 1e6
+            r = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1, "method": method,
+                                         "params": params}, timeout=8).json()
+            if "result" in r:
+                return r["result"]
         except Exception:
             continue
     return None
+
+
+def _erc20_balance(token, addr):
+    data = "0x70a08231" + addr[2:].lower().rjust(64, "0")  # balanceOf(addr)
+    res = _rpc("eth_call", [{"to": token, "data": data}, "latest"])
+    return int(res, 16) / 1e6 if res else None
+
+
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def watch_deposits():
+    """Auto-track top-ups: new collateral arriving at the funder wallet bumps the
+    invested basis (and logs it) so the return math survives deposits without
+    manual bookkeeping. Counts ONLY plain transfer() sends — tx.to == the token
+    contract itself, which is what an exchange withdrawal or wallet-to-wallet
+    send looks like. Exchange fills route through Polymarket's contracts and can
+    never masquerade as one. Withdrawals stay manual (adjust in Settings)."""
+    funder = (STATE.get("funder") or os.environ.get("PM_FUNDER") or "").lower()
+    if not valid_addr(funder) or INVESTED <= 0:
+        return  # no basis set = the investment panel is off; nothing to track against
+    latest = _rpc("eth_blockNumber", [])
+    if not latest:
+        return
+    latest = int(latest, 16)
+    start = int(STATE.get("dep_block") or 0)
+    if start <= 0 or latest - start > 200_000:
+        with LOCK:  # first run / long gap: watch from now on
+            STATE["dep_block"] = latest  # ponytail: no historic backfill — set the basis by hand once
+        return
+    pad = "0x" + funder[2:].rjust(64, "0")
+    got, ok = 0.0, True
+    for token in (PUSD, USDC_E):
+        logs = _rpc("eth_getLogs", [{"fromBlock": hex(start + 1), "toBlock": hex(latest),
+                                     "address": token, "topics": [TRANSFER_TOPIC, None, pad]}])
+        if logs is None:
+            ok = False  # that token's window failed — retry the whole window next pass
+            continue
+        for lg in logs:
+            tx = _rpc("eth_getTransactionByHash", [lg.get("transactionHash")])
+            if tx and (tx.get("to") or "").lower() == token.lower():
+                got += int(lg.get("data", "0x0"), 16) / 1e6
+    if not ok:
+        return
+    with LOCK:
+        STATE["dep_block"] = latest
+    if got >= 0.5:  # dust below this isn't a deposit, it's noise
+        globals()["INVESTED"] = round(INVESTED + got, 2)
+        save_config()
+        logline(hist=True, kind="live", side="DEPOSIT",
+                note=f"+${got:.2f} deposit detected on-chain — invested basis now ${INVESTED:.2f} "
+                     "(banking hurdle moved with it)")
 
 
 def onchain_usdc(addr):
@@ -1489,6 +1575,7 @@ def bot_loop():
             if leaders:
                 with LOCK:
                     STATE["leaders"] = leaders
+            watch_deposits()  # ~5 min cadence is plenty for spotting top-ups
         fetch_wallet()
         settle_resolved()
         reconcile_ghosts()
@@ -3028,6 +3115,72 @@ def _check():
         assert ("ab" * 32) not in _settings_form(), "private key leaked into the page!"
     finally:
         globals()["PRIVATE_KEY_MEM"] = None
+
+    # deposit watcher: a direct transfer() bumps the basis + logs it; an exchange-
+    # routed fill doesn't; an RPC failure retries the same window instead of skipping
+    _orpc, fund = _rpc, "0x" + "f" * 40
+    STATE["funder"], globals()["INVESTED"] = fund, 30.0
+    STATE["dep_block"] = 100
+
+    def _fake_rpc(method, params):
+        if method == "eth_blockNumber":
+            return hex(120)
+        if method == "eth_getLogs":
+            return ([{"transactionHash": "0xdep", "data": hex(25_000_000)},
+                     {"transactionHash": "0xfill", "data": hex(9_000_000)}]
+                    if params[0]["address"] == PUSD else [])
+        if method == "eth_getTransactionByHash":
+            return {"to": PUSD} if params[0] == "0xdep" else {"to": "0xExchangeContract"}
+        return None
+    globals()["_rpc"] = _fake_rpc
+    watch_deposits()
+    assert INVESTED == 55.0 and STATE["dep_block"] == 120  # $25 direct send counted, fill ignored
+    assert any(e.get("side") == "DEPOSIT" for e in STATE["history"][-3:])
+    globals()["_rpc"] = lambda m, p: hex(200) if m == "eth_blockNumber" else None
+    watch_deposits()
+    assert STATE["dep_block"] == 120                       # getLogs failed → cursor holds, retry next pass
+    globals()["_rpc"] = _fake_rpc
+    STATE["dep_block"] = 0
+    watch_deposits()
+    assert STATE["dep_block"] == 120 and INVESTED == 55.0  # fresh cursor baselines only, no backfill
+    globals()["INVESTED"], STATE["funder"], STATE["dep_block"] = 0.0, "", 0
+    globals()["_rpc"] = _orpc
+
+    # key vault: a plaintext key migrates into the OS vault (verified round-trip) and
+    # out of the config file; a fresh boot reads it back from the vault; a box with
+    # no vault at all keeps the plaintext fallback working
+    class _FakeKR:
+        store = {}
+
+        def set_password(self, s, u, p):
+            _FakeKR.store[(s, u)] = p
+
+        def get_password(self, s, u):
+            return _FakeKR.store.get((s, u))
+    sys.modules["keyring"] = _FakeKR()  # never let the self-check touch the real vault
+    _kk = "0x" + "ab" * 32
+    CONFIG_FILE.write_text(json.dumps({"targets": [], "private_key": _kk}))
+    load_config()
+    assert PRIVATE_KEY_MEM == _kk and STATE["pk_set"]
+    assert _kk not in CONFIG_FILE.read_text()                # plaintext gone from disk
+    assert _FakeKR.store[("copybot", "private_key")] == _kk  # ...and living in the vault
+    globals()["PRIVATE_KEY_MEM"] = None
+    load_config()                                            # fresh boot: key comes from the vault
+    assert PRIVATE_KEY_MEM == _kk
+
+    class _NoKR:  # a box with no usable vault: everything raises
+        def set_password(self, *a):
+            raise RuntimeError("no vault")
+
+        def get_password(self, *a):
+            raise RuntimeError("no vault")
+    sys.modules["keyring"] = _NoKR()
+    globals()["PRIVATE_KEY_MEM"] = "0x" + "cd" * 32
+    save_config()
+    assert ("cd" * 32) in CONFIG_FILE.read_text()            # documented plaintext fallback
+    globals()["PRIVATE_KEY_MEM"] = None
+    sys.modules.pop("keyring", None)
+    CONFIG_FILE.unlink(missing_ok=True)
 
     # ledger audit: a mislabeled ghost gets rewritten and a lost cost re-counted
     STATE["history"] = [{"side": "GHOST", "kind": "skip", "name": LEDGER_AUDIT_0707[0][0],

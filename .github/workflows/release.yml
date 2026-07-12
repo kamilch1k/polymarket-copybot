@@ -25,7 +25,8 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name Copybot
           --collect-all py_clob_client_v2 --collect-all eth_account
           --collect-all eth_utils --collect-all websocket
-          --collect-all webview --collect-all regex copybot.py
+          --collect-all webview --collect-all regex
+          --collect-all keyring copybot.py
       - name: self-check the packaged binary
         shell: bash
         run: |
