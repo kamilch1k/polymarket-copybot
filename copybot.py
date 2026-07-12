@@ -51,6 +51,10 @@ SPEND_CAP = 15.0             # hard stop: total live BUY $ the bot may ever spen
 MAX_DAYS_OUT = 0.0           # only copy BUYs on markets ending within N days (0 = any horizon)
 MAX_LEGS_PER_EVENT = 2       # max open BUY legs per match/event (0 = uncapped) — same-match
                              # legs are near-perfectly correlated: m legs act as ONE bet at m× size
+TP_PRICE = 0.95              # auto take-profit: sell when a position's mid reaches this price
+                             # (the last cents aren't worth in-play reversal risk; 0 = off)
+TP_GAIN_PCT = 120.0          # auto take-profit: sell when the mid gained ≥N% over our entry
+                             # (rode-to-$88 positions get REALIZED, not just marked; 0 = off)
 INVESTED = 0.0               # owner's cost basis (set in Settings) — powers the My-investment panel
 BANK_PCT = 50.0              # % of new profit locked out of the budget (0 = off):
                              # banked money is never re-bet, so peaks survive the next drawdown
@@ -256,6 +260,8 @@ def load_config():
     globals()["INVESTED"] = float(c.get("invested", INVESTED))
     globals()["BANK_PCT"] = float(c.get("bank_pct", BANK_PCT))
     globals()["BANK_HURDLE_PCT"] = float(c.get("bank_hurdle_pct", BANK_HURDLE_PCT))
+    globals()["TP_PRICE"] = float(c.get("tp_price", TP_PRICE))
+    globals()["TP_GAIN_PCT"] = float(c.get("tp_gain_pct", TP_GAIN_PCT))
     globals()["AUTO_CAP_RESERVE"] = c.get("auto_cap_reserve", AUTO_CAP_RESERVE)
     globals()["AUTO_TRADE_PCT"] = c.get("auto_trade_pct", AUTO_TRADE_PCT)
     STATE["funder"] = c.get("funder", "")
@@ -270,6 +276,7 @@ def save_config():
         "spend_cap": SPEND_CAP, "max_days_out": MAX_DAYS_OUT,
         "max_legs_per_event": MAX_LEGS_PER_EVENT,
         "invested": INVESTED, "bank_pct": BANK_PCT, "bank_hurdle_pct": BANK_HURDLE_PCT,
+        "tp_price": TP_PRICE, "tp_gain_pct": TP_GAIN_PCT,
         "auto_cap_reserve": AUTO_CAP_RESERVE, "auto_trade_pct": AUTO_TRADE_PCT,
         "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
@@ -1108,6 +1115,36 @@ def sell_position(tid):
         logline(kind="error", side="SELL", name=name, note=str(ex)[:140])
 
 
+def take_profits():
+    """Owner-requested auto-sell: realize winners instead of round-tripping them.
+    A copied position is market-sold when its mid has either reached TP_PRICE
+    (near-certainty — the remaining cents aren't worth in-play reversal risk,
+    and freed capital re-deploys: g ∝ 1/τ) or gained TP_GAIN_PCT% over entry.
+    Uses the exact same sell path as the wallet-card button; sells are gated
+    live-only there. Dry copies and unknown-basis positions ride to resolution."""
+    if TP_PRICE <= 0 and TP_GAIN_PCT <= 0:
+        return
+    with LOCK:
+        held = {t: s for t, s in STATE["holdings"].items() if s > 0}
+        costs = dict(STATE["live_cost"])
+    for tid, sh in held.items():
+        cost = costs.get(tid)
+        if not cost or sh <= 0:
+            continue
+        entry = cost / sh
+        mid = midpoint(tid)
+        if not mid:
+            continue
+        hit_price = TP_PRICE > 0 and mid >= TP_PRICE
+        hit_gain = TP_GAIN_PCT > 0 and entry > 0 and mid >= entry * (1 + TP_GAIN_PCT / 100)
+        if hit_price or hit_gain:
+            why = (f"mid {mid:.2f} ≥ {TP_PRICE:.2f}" if hit_price
+                   else f"mid {mid:.2f} = {mid / entry:.1f}× entry {entry:.2f}")
+            logline(kind="live", side="SELL", name=STATE["names"].get(tid, tid[:14]),
+                    note=f"take-profit: {why} — selling to lock it in")
+            sell_position(tid)
+
+
 def pick_test_market():
     """An active, liquid market whose token the CLOB verifiably accepts right now.
     (The target's own feed is unusable here: fast sports markets resolve within
@@ -1426,6 +1463,7 @@ def bot_loop():
         reconcile_ghosts()
         reconcile_odometer()  # floor to open stakes; release settled-loss cruft when flat
         auto_cap()
+        take_profits()  # realize winners at TP thresholds instead of marking-and-hoping
         polls += 1
 
         if not TARGETS:
@@ -1496,8 +1534,8 @@ def bot_loop():
 
 
 # ---- dashboard --------------------------------------------------------------
-KIND_COLOR = {"live": "#4ade80", "dry": "#93c5fd", "skip": "#9ca3af",
-              "error": "#f87171", "pend": "#fbbf24"}
+KIND_COLOR = {"live": "var(--ok)", "dry": "var(--info)", "skip": "var(--dim)",
+              "error": "var(--bad)", "pend": "var(--warn)"}
 
 
 def _nw(e):
@@ -1514,7 +1552,7 @@ def _pending_card():
     rows = ""
     for it in pending:
         px = limit_price(it["ref"], it["side"])
-        col = "#4ade80" if it["side"] == "BUY" else "#fca5a5"
+        col = "var(--ok)" if it["side"] == "BUY" else "var(--bad)"
         rows += (f'<tr><td class=dim>{it["t"]}</td><td style=color:{col}>{it["side"]}</td>'
                  f'<td>{_nw(it)}</td><td class=r>{it["shares"]:g} @ {px}</td><td>'
                  f'<form method=post action=/approve style=display:inline>'
@@ -1591,7 +1629,7 @@ def _wallet_card():
     for p in pos:
         pnl = float(p.get("cashPnl") or 0)
         pct = float(p.get("percentPnl") or 0)
-        col = "#4ade80" if pnl >= 0 else "#f87171"
+        col = "var(--ok)" if pnl >= 0 else "var(--bad)"
         sell = ""
         if p.get("asset") and not p.get("redeemable"):
             sell = (f'<form method=post action=/sellpos style=display:inline '
@@ -1642,7 +1680,7 @@ def _target_rows():
     now = time.time()
     for t in feed:
         side = str(t.get("side", "")).upper()
-        col = "#4ade80" if side == "BUY" else "#fca5a5"
+        col = "var(--ok)" if side == "BUY" else "var(--bad)"
         name = f"{t.get('title', '?')} — {t.get('outcome', '?')}"
         ts = t.get("timestamp")
         when = time.strftime("%m-%d %H:%M", time.localtime(float(ts))) if ts else ""
@@ -1703,9 +1741,8 @@ def _roster_card():
         f'<div class=card style=margin-bottom:16px><h2 style=margin-top:0>Copying roster — who the bot mirrors</h2>'
         f'<table><tr><th>trader</th><th>positions</th><th class=r></th></tr>{rows}</table>'
         f'<form method=post action=/target style="display:flex;gap:8px;margin-top:10px">'
-        f'<input name=addr placeholder="paste a trader&#39;s 0x wallet address to start copying them" required '
-        f'pattern="0x[0-9a-fA-F]{{40}}" title="a Polymarket wallet address: 0x followed by 40 hex characters" '
-        f'style="flex:1;background:#0f1523;border:1px solid #334155;border-radius:8px;color:#e5e7eb;padding:8px 10px;font:inherit">'
+        f'<input name=addr class=in placeholder="paste a trader&#39;s 0x wallet address to start copying them" required '
+        f'pattern="0x[0-9a-fA-F]{{40}}" title="a Polymarket wallet address: 0x followed by 40 hex characters">'
         f'<button class=go>▶ start copying</button></form>'
         f'<div class=dim style="margin-top:6px">adding baselines their past trades and copies from now on · '
         f'removing stops new copies (open positions stay yours) · the scout finds candidates by the selection math</div></div>')
@@ -1728,7 +1765,7 @@ def _invest_card():
         total = cash + sum(float(p.get("currentValue") or 0) for p in w.get("positions", []))
         pnl = total - INVESTED
         pct = pnl / INVESTED * 100
-        col = "#4ade80" if pnl >= 0 else "#f87171"
+        col = "var(--ok)" if pnl >= 0 else "var(--bad)"
         at_risk = max(0.0, total - banked)
         hurdle_lv = INVESTED * (1 + BANK_HURDLE_PCT / 100)
         if BANK_PCT <= 0:
@@ -1803,7 +1840,7 @@ def _leader_rows():
         btn = (f'<form method=post action=/target style=margin:0><input type=hidden name=addr value="{addr}">'
                f'<button class={cls}>{label}</button></form>') if addr else ""
         out += (f'<tr{here}><td class=dim>{i}</td><td>{nm}</td>'
-                f'<td class=r style=color:#4ade80>{pnl}</td><td>{btn}</td></tr>')
+                f'<td class=r style=color:var(--ok)>{pnl}</td><td>{btn}</td></tr>')
     return out or "<tr><td colspan=4 class=dim>leaderboard loading…</td></tr>"
 
 
@@ -1958,7 +1995,7 @@ def _scout_card():
            f'<button class=go {"disabled" if s["running"] else ""}>'
            f'{"scanning…" if s["running"] else "Scan for copyable traders"}</button></form>')
     note = f' <span class="tag dim">{html.escape(s["note"])}</span>' if s["note"] else ""
-    vcol = {"PASS": "#4ade80", "mm-bot — uncopyable": "#9ca3af",
+    vcol = {"PASS": "var(--ok)", "mm-bot — uncopyable": "var(--dim)",
             "long-horizon": "#9ca3af", "idle this week": "#9ca3af"}
     rows = ""
     for r in sorted(s["rows"], key=lambda r: -(r["net"][0] if r.get("net") else 9e9), reverse=False):
@@ -1999,8 +2036,8 @@ def _settings_form():
     pk_val = PRIVATE_KEY_MEM or os.environ.get("PM_PRIVATE_KEY", "")
     funder_val = STATE.get("funder", "") or os.environ.get("PM_FUNDER", "")
     signer = key_wallet(pk_val)
-    key_note = (f' — <span style=color:#4ade80>✓ real key, signs as {signer}</span>' if signer
-                else (' — <span style=color:#f87171>✗ not a valid key</span>' if pk_val else ""))
+    key_note = (f' — <span style=color:var(--ok)>✓ real key, signs as {signer}</span>' if signer
+                else (' — <span style=color:var(--bad)>✗ not a valid key</span>' if pk_val else ""))
     return f"""<div class=card style=margin-bottom:16px>
 <h2 style=margin-top:0>⚙ Settings {'· ✅ ready' if is_ready else '· ⚠ setup needed'}</h2>
 <form method=post action=/settings class=settings>
@@ -2020,6 +2057,8 @@ def _settings_form():
     <span id=capnote class=dim style="display:none">← overridden while auto budget is on</span></label>
   <label>Only copy markets ending within <input name=max_days_out value="{MAX_DAYS_OUT:g}"> days (0 = any horizon; sells always follow)</label>
   <label>Max open legs per match/event <input name=max_legs_per_event value="{MAX_LEGS_PER_EVENT}"> (0 = uncapped — same-match legs are correlated: m legs ≈ one bet at m× size)</label>
+  <label>Auto take-profit at price ≥ <input name=tp_price value="{TP_PRICE:g}"> (sell near-certain winners; 0 = off)</label>
+  <label>Auto take-profit at gain ≥ <input name=tp_gain_pct value="{TP_GAIN_PCT:g}">% over entry (realize the spike instead of watching it round-trip; 0 = off)</label>
   <label>I invested $<input name=invested value="{INVESTED:g}"> (cost basis — powers the My-investment panel)</label>
   <label>Bank <input name=bank_pct value="{BANK_PCT:g}">% of new-high profit (0 = off; banked money is never re-bet)</label>
   <label>…but only above +<input name=bank_hurdle_pct value="{BANK_HURDLE_PCT:g}">% profit over basis (hurdle — don't choke the budget while barely above water)</label>
@@ -2131,6 +2170,8 @@ def render_dyn():
   <span class="tag dim">up {up // 3600}h{up % 3600 // 60}m</span>
   <span class="tag dim">polled {age}</span>
   {toggle}
+  <button onclick="var r=document.documentElement,t=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=t;localStorage.theme=t"
+          title="switch light / dark theme">◐</button>
   <form method=post action=/kill style=display:inline onsubmit="return confirm('Kill the bot?')"><button class=kill>Kill</button></form>
 </div>
 {errbar}
@@ -2170,34 +2211,44 @@ BUILD = time.strftime("%Y-%m-%d %H:%M", time.localtime(Path(__file__).stat().st_
 
 def render():
     return f"""<!doctype html><html><head><meta charset=utf-8>
-<title>copybot</title><style>
-body{{background:#0b0f17;color:#e5e7eb;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:18px;max-width:1100px}}
-h1{{font-size:15px;margin:0 0 12px}} .dim{{color:#6b7280}} .r{{text-align:right}}
-.bar{{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px}}
-.grid{{display:grid;grid-template-columns:1fr 1fr;gap:22px}}
-span.pill,span.tag{{padding:3px 9px;border-radius:6px;font-weight:600}}
-button{{border:0;border-radius:6px;padding:6px 13px;font:inherit;font-weight:700;cursor:pointer}}
-button.go{{background:#166534;color:#fff}} button.dry{{background:#374151;color:#fff}}
-button.kill{{background:#7f1d1d;color:#fff}} button.copy{{background:#1d4ed8;color:#fff;padding:3px 10px}}
-button.save{{background:#1d4ed8;color:#fff;margin-top:4px}}
-table{{border-collapse:collapse;width:100%;margin:4px 0 16px}}
-td,th{{padding:4px 9px;border-bottom:1px solid #1f2937;text-align:left}} th{{color:#9ca3af;font-weight:600}}
-h2{{font-size:12px;color:#9ca3af;text-transform:uppercase;letter-spacing:.05em;margin:14px 0 2px}}
-.err{{background:#7f1d1d;color:#fecaca;padding:6px 10px;border-radius:6px;margin-bottom:12px}}
-ul.tips{{margin:4px 0 16px;padding-left:18px}} ul.tips li{{margin:2px 0}}
-.card{{background:#0f1523;border:1px solid #1f2937;border-radius:10px;padding:14px 16px}}
-details.cfg{{background:#0f1523;border:1px solid #1f2937;border-radius:10px;padding:10px 14px;margin-bottom:16px}}
+<title>copybot</title>
+<script>document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark')</script>
+<style>
+:root{{--bg:#0d1117;--card:#161b22;--card2:#0d1117;--text:#e6edf3;--dim:#8b949e;--line:#30363d;
+--ok:#3fb950;--bad:#f85149;--warn:#d29922;--info:#58a6ff;--btn:#21262d;--accent:#1f6feb;--shadow:none}}
+:root[data-theme=light]{{--bg:#f6f8fa;--card:#ffffff;--card2:#f6f8fa;--text:#1f2328;--dim:#59636e;--line:#d1d9e0;
+--ok:#1a7f37;--bad:#cf222e;--warn:#9a6700;--info:#0969da;--btn:#eff2f5;--accent:#0969da;--shadow:0 1px 3px rgba(31,35,40,.08)}}
+body{{background:var(--bg);color:var(--text);font:13.5px/1.55 ui-sans-serif,system-ui,"Segoe UI",sans-serif;margin:0 auto;padding:20px;max-width:1100px}}
+table,.tag,.pill,input,select,code{{font-family:ui-monospace,Menlo,Consolas,monospace}}
+h1{{font-size:16px;margin:0 0 14px}} .dim{{color:var(--dim)}} .r{{text-align:right}}
+.bar{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}}
+.grid{{display:grid;grid-template-columns:1fr 1fr;gap:20px}}
+span.pill,span.tag{{padding:3px 10px;border-radius:999px;font-weight:600;font-size:12px;background:var(--btn);border:1px solid var(--line)}}
+button{{border:1px solid var(--line);border-radius:8px;padding:6px 13px;font:inherit;font-weight:600;cursor:pointer;background:var(--btn);color:var(--text)}}
+button:hover{{filter:brightness(1.08)}}
+button.go{{background:var(--ok);border-color:transparent;color:#fff}}
+button.dry{{background:var(--warn);border-color:transparent;color:#fff}}
+button.kill{{background:var(--bad);border-color:transparent;color:#fff}}
+button.copy,button.save{{background:var(--accent);border-color:transparent;color:#fff;padding:4px 11px}}
+table{{border-collapse:collapse;width:100%;margin:4px 0 14px;font-size:12.5px}}
+td,th{{padding:5px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}
+th{{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}}
+h2{{font-size:11.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin:16px 0 4px}}
+.err{{background:var(--bad);color:#fff;padding:8px 12px;border-radius:8px;margin-bottom:12px}}
+ul.tips{{margin:4px 0 14px;padding-left:18px}} ul.tips li{{margin:2px 0}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow)}}
+details.cfg{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin-bottom:16px;box-shadow:var(--shadow)}}
 details.cfg summary{{cursor:pointer;font-weight:700}}
 .settings{{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin-top:12px}}
-.settings label{{display:flex;flex-direction:column;font-size:11px;color:#9ca3af;gap:3px}}
-.settings input,.settings select{{background:#0b0f17;border:1px solid #334155;border-radius:6px;color:#e5e7eb;padding:6px 8px;font:inherit}}
+.settings label{{display:flex;flex-direction:column;font-size:11px;color:var(--dim);gap:3px}}
+input,select{{background:var(--card2);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:6px 8px;font:inherit}}
 .settings button{{grid-column:1/-1;justify-self:start}}
+.in{{flex:1;background:var(--card2);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:8px 10px;font:inherit}}
 </style></head><body>
 <h1>Polymarket copybot <span class=dim style=font-weight:400>build {BUILD}</span></h1>
 {_settings_form()}
 <form method=post action=/ask style="display:flex;gap:8px;margin-bottom:14px">
-  <input name=q autocomplete=off placeholder="Ask Claude anything about the bot — or tell it to change settings, switch modes, go live/dry…"
-         style="flex:1;background:#0f1523;border:1px solid #334155;border-radius:8px;color:#e5e7eb;padding:8px 10px;font:inherit">
+  <input name=q autocomplete=off class=in placeholder="Ask Claude anything about the bot — or tell it to change settings, switch modes, go live/dry…">
   <button class=copy>Ask Claude</button>
 </form>
 <div id=dyn>{render_dyn()}</div>
@@ -2224,7 +2275,7 @@ details.cfg summary{{cursor:pointer;font-weight:700}}
       if (!v) {{ inp.style.border = ''; hint.textContent = ''; return; }}
       var good = rule.test(v);
       inp.style.border = '2px solid ' + (good ? '#16a34a' : '#dc2626');
-      hint.style.color = good ? '#4ade80' : '#f87171';
+      hint.style.color = good ? 'var(--ok)' : 'var(--bad)';
       hint.textContent = good ? rule.ok : rule.bad;
     }};
     inp.addEventListener('input', paint);
@@ -2388,6 +2439,8 @@ class Handler(BaseHTTPRequestHandler):
             globals()["INVESTED"] = num("invested", INVESTED)
             globals()["BANK_PCT"] = num("bank_pct", BANK_PCT)
             globals()["BANK_HURDLE_PCT"] = num("bank_hurdle_pct", BANK_HURDLE_PCT)
+            globals()["TP_PRICE"] = num("tp_price", TP_PRICE)
+            globals()["TP_GAIN_PCT"] = num("tp_gain_pct", TP_GAIN_PCT)
             with LOCK:
                 STATE["banked"] = max(0.0, num("banked", STATE["banked"]))
             save_state()
@@ -2551,6 +2604,26 @@ def _check():
     bank_profits(31.0)  # cost basis unset: the mark tracks, nothing banks
     assert STATE["banked"] == 0.0 and STATE["hwm"] == 31.0
     STATE["hwm"] = 0.0
+
+    # auto take-profit: price-hit and gain-hit sell, in-band positions ride on
+    tp_calls = []
+    _osp, _omid2 = sell_position, midpoint
+    globals()["sell_position"] = lambda t: tp_calls.append(t)
+    globals()["midpoint"] = lambda t: {"tpA": 0.97, "tpB": 0.70, "tpC": 0.60}.get(t)
+    globals()["TP_PRICE"], globals()["TP_GAIN_PCT"] = 0.95, 100.0
+    STATE["holdings"].update({"tpA": 2.0, "tpB": 2.0, "tpC": 2.0})
+    STATE["live_cost"].update({"tpA": 1.0, "tpB": 0.6, "tpC": 1.0})  # entries 0.50 / 0.30 / 0.50
+    take_profits()
+    assert tp_calls == ["tpA", "tpB"], tp_calls  # 0.97 ≥ price TP; 0.70 = 2.3× entry ≥ gain TP; tpC holds
+    globals()["TP_PRICE"], globals()["TP_GAIN_PCT"] = 0.0, 0.0
+    tp_calls.clear()
+    take_profits()
+    assert tp_calls == []  # both knobs off -> feature fully dormant
+    globals()["TP_PRICE"], globals()["TP_GAIN_PCT"] = 0.95, 120.0
+    globals()["sell_position"], globals()["midpoint"] = _osp, _omid2
+    for k in ("tpA", "tpB", "tpC"):
+        STATE["holdings"].pop(k, None)
+        STATE["live_cost"].pop(k, None)
     # resolution frees budget: live win credits, dry win doesn't, loss stays counted
     STATE["holdings"].update({"w1": 2.0, "w2": 3.0, "w3": 4.0})
     STATE["live_cost"] = {"w1": 1.0, "w3": 1.2}
