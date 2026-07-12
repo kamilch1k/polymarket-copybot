@@ -50,8 +50,10 @@ MAX_DAYS_OUT = 0.0           # only copy BUYs on markets ending within N days (0
 MAX_LEGS_PER_EVENT = 2       # max open BUY legs per match/event (0 = uncapped) — same-match
                              # legs are near-perfectly correlated: m legs act as ONE bet at m× size
 INVESTED = 0.0               # owner's cost basis (set in Settings) — powers the My-investment panel
-BANK_PCT = 50.0              # % of every new-high profit locked out of the budget (0 = off):
+BANK_PCT = 50.0              # % of new profit locked out of the budget (0 = off):
                              # banked money is never re-bet, so peaks survive the next drawdown
+BANK_HURDLE_PCT = 20.0       # banking starts only above basis+N% — protecting "profit" at +2%
+                             # would strangle compounding exactly where variance recrosses basis
 AUTO_CAP_RESERVE = 8.0       # auto-budget: SPEND_CAP = wallet total − this reserve (0 = manual cap)
 AUTO_TRADE_PCT = 10.0        # auto-size: MAX_USDC_PER_TRADE = this % of wallet, $5 floor (0 = manual)
 MODE = "auto"                 # "auto" = copy instantly · "approve" = queue for your click
@@ -92,8 +94,10 @@ STATE = {
     "bought_at": {},             # token -> epoch of our buy (ghost-reconcile grace period)
     "missing_deps": [],          # runtime modules that failed to import at startup
     "who": {},                   # token -> trader we copied the open position from
-    "hwm": 0.0,                  # all-time-high wallet equity (cash + positions)
+    "hwm": 0.0,                  # all-time-high wallet equity (cash + positions) — display truth
     "banked": 0.0,               # profit locked at new highs — the cap never redeploys it
+    "bank_base": 0.0,            # level up to which profit has been banked (≠ hwm: small gains
+                                 # accumulate here until worth locking, instead of leaking as dust)
 }
 
 
@@ -237,6 +241,7 @@ def load_config():
     globals()["MAX_LEGS_PER_EVENT"] = int(c.get("max_legs_per_event", MAX_LEGS_PER_EVENT))
     globals()["INVESTED"] = float(c.get("invested", INVESTED))
     globals()["BANK_PCT"] = float(c.get("bank_pct", BANK_PCT))
+    globals()["BANK_HURDLE_PCT"] = float(c.get("bank_hurdle_pct", BANK_HURDLE_PCT))
     globals()["AUTO_CAP_RESERVE"] = c.get("auto_cap_reserve", AUTO_CAP_RESERVE)
     globals()["AUTO_TRADE_PCT"] = c.get("auto_trade_pct", AUTO_TRADE_PCT)
     STATE["funder"] = c.get("funder", "")
@@ -249,7 +254,7 @@ def save_config():
         "mode": MODE, "min_his": MIN_HIS_NOTIONAL, "sig_type": SIGNATURE_TYPE,
         "spend_cap": SPEND_CAP, "max_days_out": MAX_DAYS_OUT,
         "max_legs_per_event": MAX_LEGS_PER_EVENT,
-        "invested": INVESTED, "bank_pct": BANK_PCT,
+        "invested": INVESTED, "bank_pct": BANK_PCT, "bank_hurdle_pct": BANK_HURDLE_PCT,
         "auto_cap_reserve": AUTO_CAP_RESERVE, "auto_trade_pct": AUTO_TRADE_PCT,
         "private_key": PRIVATE_KEY_MEM or ""}, indent=2))
 
@@ -268,6 +273,7 @@ def load_state():
     STATE["who"] = s.get("who", {})
     STATE["hwm"] = s.get("hwm", 0.0)
     STATE["banked"] = s.get("banked", 0.0)
+    STATE["bank_base"] = s.get("bank_base", 0.0)
     # backfill attribution for positions bought before the who-map existed:
     # BUY history entries have carried the trader name since day one
     bywho = {e.get("name"): e["who"] for e in STATE["history"]
@@ -285,7 +291,7 @@ def save_state():
                 "names": STATE["names"], "history": STATE["history"][-500:],
                 "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"],
                 "bought_at": STATE["bought_at"], "who": STATE["who"],
-                "hwm": STATE["hwm"], "banked": STATE["banked"]}
+                "hwm": STATE["hwm"], "banked": STATE["banked"], "bank_base": STATE["bank_base"]}
     STATE_FILE.write_text(json.dumps(data))
 
 
@@ -605,22 +611,27 @@ def reconcile_odometer():
 
 
 def bank_profits(total):
-    """New-high profit skim: when equity sets a high-water mark, lock BANK_PCT%
-    of the profit above the previous mark (and above cost basis) into 'banked' —
-    money the auto-cap treats as extra reserve and never redeploys. This is what
-    makes peaks survivable: rode-to-$88-back-to-$31 keeps a chunk, not a story.
-    Needs INVESTED set (else profit is undefined); the HWM tracks regardless."""
+    """Hurdled profit skim. The display high-water mark always tracks equity;
+    banking is separate and stricter: it starts only above basis+hurdle (no
+    strangling the budget while barely above water, where variance recrosses
+    basis constantly), and it locks BANK_PCT% of gains above 'bank_base' — the
+    level already banked up to. Sub-$0.50 skims accumulate (bank_base doesn't
+    advance) instead of leaking away as dust. Banked money never redeploys —
+    that's what makes rode-to-$88-back-to-$31 keep a chunk, not a story."""
     added = 0.0
     with LOCK:
-        hwm = STATE["hwm"]
-        if total > hwm + 0.005:
-            base = max(hwm, INVESTED)
-            if BANK_PCT > 0 and INVESTED > 0 and total > base:
-                added = round((total - base) * BANK_PCT / 100, 2)
-                if added >= 0.01:
-                    STATE["banked"] = round(STATE["banked"] + added, 2)
+        if total > STATE["hwm"] + 0.005:
             STATE["hwm"] = round(total, 2)
-    if added >= 0.01:
+        if BANK_PCT > 0 and INVESTED > 0:
+            base = max(STATE["bank_base"], INVESTED * (1 + BANK_HURDLE_PCT / 100))
+            gain = total - base
+            if gain > 0:
+                add = round(gain * BANK_PCT / 100, 2)
+                if add >= 0.50:  # ponytail: fixed $0.50 step; scale-aware step if bankrolls grow
+                    STATE["banked"] = round(STATE["banked"] + add, 2)
+                    STATE["bank_base"] = round(total, 2)
+                    added = add
+    if added:
         logline(kind="live", note=f"profit banked: ${added:.2f} locked at new high ${total:.2f} "
                                   f"(banked total ${STATE['banked']:.2f} — never re-bet)")
         save_state()
@@ -1690,12 +1701,19 @@ def _invest_card():
         pct = pnl / INVESTED * 100
         col = "#4ade80" if pnl >= 0 else "#f87171"
         at_risk = max(0.0, total - banked)
+        hurdle_lv = INVESTED * (1 + BANK_HURDLE_PCT / 100)
+        if BANK_PCT <= 0:
+            bank_bit = "profit banking off"
+        elif banked:
+            bank_bit = f'banked profit <b>${banked:,.2f}</b> (locked at highs, never re-bet)'
+        else:
+            bank_bit = (f'banking starts above ${hurdle_lv:,.2f} '
+                        f'(+{BANK_HURDLE_PCT:g}% over basis) — then {BANK_PCT:g}% of gains get locked')
         body = (f'<div style=margin-bottom:4px>invested <b>${INVESTED:,.2f}</b> → now '
                 f'<b>${total:,.2f}</b> <span style=color:{col}>({pnl:+,.2f} · {pct:+.1f}%)</span> '
                 f'· all-time high ${hwm:,.2f}</div>'
-                f'<div class=dim>banked profit <b>${banked:,.2f}</b> (locked at new highs, never re-bet'
-                f'{f", {BANK_PCT:g}% of each new high" if BANK_PCT > 0 else " — banking off"}) · '
-                f'still in play ${at_risk:,.2f} · withdraw any time on polymarket.com — your wallet, your custody</div>')
+                f'<div class=dim>{bank_bit} · still in play ${at_risk:,.2f} · '
+                f'withdraw any time on polymarket.com — your wallet, your custody</div>')
     return f'<div class=card style=margin-bottom:16px><h2 style=margin-top:0>My investment</h2>{body}</div>'
 
 
@@ -1973,7 +1991,8 @@ def _settings_form():
   <label>Only copy markets ending within <input name=max_days_out value="{MAX_DAYS_OUT:g}"> days (0 = any horizon; sells always follow)</label>
   <label>Max open legs per match/event <input name=max_legs_per_event value="{MAX_LEGS_PER_EVENT}"> (0 = uncapped — same-match legs are correlated: m legs ≈ one bet at m× size)</label>
   <label>I invested $<input name=invested value="{INVESTED:g}"> (cost basis — powers the My-investment panel)</label>
-  <label>Bank <input name=bank_pct value="{BANK_PCT:g}">% of every new-high profit (0 = off; banked money is never re-bet)</label>
+  <label>Bank <input name=bank_pct value="{BANK_PCT:g}">% of new-high profit (0 = off; banked money is never re-bet)</label>
+  <label>…but only above +<input name=bank_hurdle_pct value="{BANK_HURDLE_PCT:g}">% profit over basis (hurdle — don't choke the budget while barely above water)</label>
   <label>Banked so far $<input name=banked value="{STATE['banked']:g}"> (grows automatically at new highs — lower it by hand after you withdraw)</label>
   <label><span style="display:flex;align-items:center;gap:6px"><input type=checkbox id=acr_on style="width:auto;margin:0">
     Auto budget — cap = wallet total minus this $ reserve (uncheck for manual cap)</span>
@@ -2337,6 +2356,7 @@ class Handler(BaseHTTPRequestHandler):
             globals()["MAX_LEGS_PER_EVENT"] = int(num("max_legs_per_event", MAX_LEGS_PER_EVENT))
             globals()["INVESTED"] = num("invested", INVESTED)
             globals()["BANK_PCT"] = num("bank_pct", BANK_PCT)
+            globals()["BANK_HURDLE_PCT"] = num("bank_hurdle_pct", BANK_HURDLE_PCT)
             with LOCK:
                 STATE["banked"] = max(0.0, num("banked", STATE["banked"]))
             save_state()
@@ -2473,22 +2493,28 @@ def _check():
     TARGETS.remove(_ta)
     assert "no targets yet" in _roster_card()
 
-    # profit banking: a new high locks a slice of the profit above max(prev high, invested)
-    globals()["INVESTED"], globals()["BANK_PCT"] = 30.0, 50.0
-    STATE["hwm"], STATE["banked"] = 50.0, 0.0
-    bank_profits(88.0)
-    assert STATE["banked"] == 19.0 and STATE["hwm"] == 88.0
-    bank_profits(31.0)  # drawdown: the mark and the bank both hold
-    assert STATE["banked"] == 19.0 and STATE["hwm"] == 88.0
-    bank_profits(90.0)  # only the slice above the old mark banks
-    assert STATE["banked"] == 20.0 and STATE["hwm"] == 90.0
+    # profit banking: hurdled, dust-accumulating, display-mark decoupled
+    globals()["INVESTED"], globals()["BANK_PCT"], globals()["BANK_HURDLE_PCT"] = 30.0, 50.0, 20.0
+    STATE["hwm"], STATE["banked"], STATE["bank_base"] = 0.0, 0.0, 0.0
+    bank_profits(31.0)   # above basis but below the +20% hurdle ($36): mark moves, nothing locks
+    assert STATE["banked"] == 0.0 and STATE["hwm"] == 31.0
+    bank_profits(88.0)   # above hurdle: lock 50% of (88 − 36)
+    assert STATE["banked"] == 26.0 and STATE["bank_base"] == 88.0 and STATE["hwm"] == 88.0
+    bank_profits(31.0)   # drawdown: bank and base hold, mark holds
+    assert STATE["banked"] == 26.0 and STATE["bank_base"] == 88.0
+    bank_profits(88.5)   # new high but the skim (< $0.50) accumulates instead of dust-locking
+    assert STATE["banked"] == 26.0 and STATE["bank_base"] == 88.0 and STATE["hwm"] == 88.5
+    bank_profits(90.0)   # accumulated gain over the base finally locks
+    assert STATE["banked"] == 27.0 and STATE["bank_base"] == 90.0
     # invest card: full numbers when the basis is set, a setup nag when it isn't
     STATE["wallet"] = {"usdc": 20.0, "positions": [{"currentValue": 11.47}]}
     card = _invest_card()
-    assert "$31.47" in card and "+4.9%" in card and "$90.00" in card and "$20.00" in card
+    assert "$31.47" in card and "+4.9%" in card and "$90.00" in card and "$27.00" in card
+    STATE["banked"] = 0.0
+    assert "banking starts above $36.00" in _invest_card()  # hurdle surfaced before first lock
     globals()["INVESTED"] = 0.0
     assert "Settings" in _invest_card()
-    STATE["hwm"], STATE["banked"], STATE["wallet"] = 0.0, 0.0, {}
+    STATE["hwm"], STATE["banked"], STATE["bank_base"], STATE["wallet"] = 0.0, 0.0, 0.0, {}
     bank_profits(31.0)  # cost basis unset: the mark tracks, nothing banks
     assert STATE["banked"] == 0.0 and STATE["hwm"] == 31.0
     STATE["hwm"] = 0.0
