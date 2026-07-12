@@ -1,0 +1,47 @@
+# Build double-clickable Copybot binaries for Windows / macOS / Linux.
+# Fires on version tags (v1.0, v1.1, ...) and by hand from the Actions tab.
+name: build apps
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install deps
+        run: pip install -r requirements.txt pyinstaller
+      - name: build one-file app
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name Copybot
+          --collect-all py_clob_client_v2 --collect-all eth_account
+          --collect-all eth_utils --collect-all websocket
+          --collect-all webview --collect-all regex copybot.py
+      - name: self-check the packaged binary
+        shell: bash
+        run: |
+          BIN=dist/Copybot; [ -f dist/Copybot.exe ] && BIN=dist/Copybot.exe
+          "$BIN" --check
+      - name: name the artifact per OS
+        shell: bash
+        run: |
+          if [ -f dist/Copybot.exe ]; then mv dist/Copybot.exe "dist/Copybot-Windows.exe";
+          else mv dist/Copybot "dist/Copybot-${{ runner.os }}"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Copybot-${{ runner.os }}
+          path: dist/Copybot-*
+      - name: attach to the release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Copybot-*

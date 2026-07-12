@@ -657,6 +657,8 @@ someone's luck.
 - **Risk gates on every copy** — no stacking (one position per market regardless of how many fills the target sprays), no chasing (skips if the price ran past the target's fill + slippage), horizon cap (skip markets resolving beyond N days), failed-buy cooldown
 - **Auto-budget** — spend cap follows the wallet (total − reserve) and per-trade size scales with it, so the bot breathes with wins and losses without manual bumps
 - **Investment panel + profit banking** — set your cost basis and the dashboard shows live return vs invested and your all-time high; above a profit hurdle (default +20% over basis) a configurable slice of new-high gains is locked out of the budget (never re-bet), so peaks survive the next drawdown without choking compounding near breakeven. Withdrawals stay on polymarket.com — your custody; the bot still contains zero transfer code
+- **Auto take-profit** — open positions are market-sold when the mid reaches 0.95 (near-certainty: the last cents aren't worth in-play reversal risk) or gains 120% over entry (both configurable, 0 = off) — the rode-to-$88-and-round-tripped failure mode gets *realized* instead of just marked
+- **Light & dark themes** — CSS-variable UI with a one-click toggle, follows your OS preference by default
 - **Chain-level reconciliation** — detects zero-filled FAK orders and auto-swept resolved positions by reading balances and the Conditional Tokens payout vector straight from Polygon, so the ledger stays true even when every Polymarket API is blind (negRisk markets)
 - **Multi-trader with attribution** — every copy, skip and log line names which target it came from
 - **Built-in trader scout** — one click re-runs the whole selection pipeline against the live leaderboard and ranks candidates by friction-adjusted net copy edge, with per-row copy buttons; results stream in as each trader is analyzed
@@ -675,6 +677,19 @@ python copybot.py --headless  # engine + local web UI only (VPS/service mode)
 python copybot.py --check     # offline self-test
 python watchdog.py            # external health + missed-trade audit
 ```
+
+**Any OS.** The same source runs on Windows, macOS and Linux — the desktop
+window is pywebview (WebView2 / Cocoa / GTK-or-Qt respectively; on Linux
+`pip install pywebview[gtk]`). No GUI stack at all? `--headless` serves the
+identical UI at `http://127.0.0.1:8777`.
+
+**As a double-clickable app.** `powershell -File package.ps1` builds
+`dist\Copybot.exe` on Windows (PyInstaller one-file, self-check included);
+tagged releases build **Windows / macOS / Linux** binaries automatically via
+GitHub Actions (`.github/workflows/release.yml`) and attach them to the
+Releases page. Config and state persist next to the app file — keep it in its
+own folder, and remember the config holds your key: same custody rules as the
+source version.
 
 Configure everything in the UI (http://127.0.0.1:8777 when headless). Config —
 including the private key, by explicit owner's choice — persists to

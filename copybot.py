@@ -69,9 +69,12 @@ SIGNATURE_TYPE = 3            # 1 = old email/magic · 2 = browser wallet · 3 =
 PORT = 8777
 HEADLESS = False              # set by --headless: no window, systemd owns the lifecycle
 PRIVATE_KEY_MEM = None        # persisted to config by owner's choice (single-user PC)
-CONFIG_FILE = Path(__file__).with_name("copybot_config.json")
-STATE_FILE = Path(__file__).with_name("copybot_state.json")
-CHAT_FILE = Path(__file__).with_name("copybot_chat.jsonl")  # persisted Claude copilot log
+# packaged as a one-file app, __file__ is a transient extraction dir — persist
+# config/state next to the executable instead so they survive relaunches
+APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+CONFIG_FILE = APP_DIR / "copybot_config.json"
+STATE_FILE = APP_DIR / "copybot_state.json"
+CHAT_FILE = APP_DIR / "copybot_chat.jsonl"  # persisted Claude copilot log
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -654,8 +657,10 @@ def bank_profits(total):
                     STATE["bank_base"] = round(total, 2)
                     added = add
     if added:
-        logline(kind="live", note=f"profit banked: ${added:.2f} locked at new high ${total:.2f} "
-                                  f"(banked total ${STATE['banked']:.2f} — never re-bet)")
+        # hist=True: every lock is a money event — keep it auditable across restarts
+        logline(hist=True, kind="live", side="BANK",
+                note=f"profit banked: ${added:.2f} locked at new high ${total:.2f} "
+                     f"(banked total ${STATE['banked']:.2f} — never re-bet)")
         save_state()
     return added
 
@@ -2206,7 +2211,10 @@ def render_dyn():
 <div class=card><table><tr><th>time</th><th>kind</th><th>side</th><th>market — outcome</th><th class=r>size</th><th>note</th></tr>{lrows}</table></div>"""
 
 
-BUILD = time.strftime("%Y-%m-%d %H:%M", time.localtime(Path(__file__).stat().st_mtime))
+try:
+    BUILD = time.strftime("%Y-%m-%d %H:%M", time.localtime(Path(__file__).stat().st_mtime))
+except OSError:  # frozen one-file app: no source file to stamp
+    BUILD = "packaged"
 
 
 def render():
