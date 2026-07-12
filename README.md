@@ -7,16 +7,26 @@ Watches one or more traders and mirrors their trades at a fraction of their size
 Built in a few days of pair-programming with Claude, then left running unattended
 with real (small) money. Everything below is from that live run.
 
-## Live results — the first week (Jul 3–10, 2026)
+## Live results (running since Jul 3, 2026)
 
-| Metric | Value |
+<!-- results:auto -->
+| Metric | Value (auto-refreshed from the live ledger by `tools/refresh_results.py`) |
 |---|---|
-| Bankroll at start | $33.11 |
-| Balance at current marks (Jul 10, 23:00) | **$50.83** — $39.47 cash + $11.36 in open positions (**+53% since start**, including two genuinely red days mid-week; the intraday marks once touched ≈$88 on thin in-play books before the Argentina–Egypt basket died) |
-| Cumulative P&L | **≈ +$17.7 at CLOB-midpoint marks** ($50.83 balance − $33.11 start); Polymarket's hourly accounting reads +$13.9 — it marks open positions at exchange prices and lags midpoints |
-| Settled copies | 44 — **26 won / 18 lost (59%)** — audited: every settlement cross-checked against the on-chain payout vector; 8 early entries were re-classified by that audit (see caveats) |
-| Capital returned by wins | $135.98 |
-| Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 2 (an earlier count of 7 was the reconciliation bug described in the caveats — the chain audit reclassified the rest as real fills) |
+| Balance at current marks (Jul 12, 2026 19:03) | **$46.48** — $46.48 cash + $0.00 in open positions (**+40% since the $33.11 start**) |
+| Cumulative P&L | **+13.37** at CLOB/data-api marks (Polymarket's hourly accounting lags unresolved legs) |
+| Settled copies | 56 — **32 won / 24 lost (57%)** — every settlement cross-checked against the on-chain payout vector |
+| Capital returned by settled wins | $159.23 |
+| Profit banked (locked out of the budget, never re-bet) | $3.44 |
+| Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 4 |
+<!-- /results:auto -->
+
+Hand-written context that doesn't change under the numbers:
+
+| | |
+|---|---|
+| Bankroll at start (Jul 3) | $33.11 |
+| Peak intraday marks | ≈$88 on thin in-play books (Jul 7) before the Argentina–Egypt basket died — the round-trip that later motivated auto take-profit and profit banking |
+| Settlement audit | 8 early ledger entries were re-classified by the on-chain payout-vector audit (see caveats); an earlier zero-fill count of 7 was that same bug |
 | Best single-match result | Portugal–Spain: 3 legs, 3 wins, ~+$12.9 on ~$16 staked |
 | Worst single match | Argentina–Egypt (Jul 7): 7 legs, ~$24 staked, net ≈ **−$12** — four died, two small legs won, one exited ≈flat via a mirrored sell |
 
@@ -24,9 +34,9 @@ Every trade above is independently verifiable on-chain:
 **[my live Polymarket profile](https://polymarket.com/@0x8df3ad8dd5893b65c23d8b3263b00fc507a1a75e-1780997991335)** —
 the bot's wallet, fills, and P&L are public record, not screenshots.
 
-Honest caveats: a week is a tiny sample, and the daily P&L is **not** a green
-staircase — Polymarket's daily closes read **−$1.5, +$18.6, +$3.6, −$0.3,
-−$4.9, −$4.8, $0.0, +$3.2**. The two red days are the Argentina–Egypt basket
+Honest caveats: this is a tiny sample, and the daily P&L is **not** a green
+staircase — the first week's Polymarket daily closes read **−$1.5, +$18.6,
++$3.6, −$0.3, −$4.9, −$4.8, $0.0, +$3.2**. The two red days are the Argentina–Egypt basket
 (seven correlated in-play legs on one match — the case study behind the
 correlation math below) and its aftermath; the flat day is downtime, not
 discipline: a budget-odometer freeze and a transient dependency failure each
@@ -40,7 +50,8 @@ corrected, and the numbers above are the audited ones. Open-position marks
 still swing; most edges were measured
 during World Cup 2026, a uniquely liquid regime that ends July 19 — the
 roster gets re-screened after that (the Jul 8 additions include a year-round
-tennis specialist precisely to outlive it). This page is updated from the
+tennis specialist precisely to outlive it, and the bot now re-runs its own
+scout weekly, logging candidates without ever auto-adding them). This page is updated from the
 live ledger, drawdowns included. Nothing here is financial advice.
 
 ### Not just football
@@ -291,6 +302,13 @@ flat clip didn't have: **longshots size themselves down** (a 14¢ ticket gets
 automatically), favorites size up but stay capped, banked profit is invisible
 to sizing exactly as it is to the budget, and the last dollars of budget
 headroom now fill as a clipped copy instead of being skipped outright.
+
+ê is now **per-trader** where a measurement exists: adding a trader from the
+scout arms them with their own pessimistic net-edge estimate (the lower bound
+of the interval the pipeline computed), editable on the roster card alongside
+a per-trader horizon cap. Stronger measured edges take proportionally larger
+stakes — the scout → roster → sizing loop is closed, one number flowing
+through unchanged. Traders without a measurement inherit the global ê.
 
 **No-chase gate** — copy only while the price hasn't outrun the signal. This
 inequality is why measured drift stays ≤ +1pp: lag cost is capped by
@@ -656,16 +674,18 @@ someone's luck.
 - **Real-time copying** — WebSocket stream of platform trades (sub-second reaction), REST polling as reconciliation + fallback, per-trade dedupe across both paths
 - **Risk gates on every copy** — no stacking (one position per market regardless of how many fills the target sprays), no chasing (skips if the price ran past the target's fill + slippage), horizon cap (skip markets resolving beyond N days), failed-buy cooldown
 - **Auto-budget** — spend cap follows the wallet (total − reserve) and per-trade size scales with it, so the bot breathes with wins and losses without manual bumps
-- **Investment panel + profit banking** — set your cost basis and the dashboard shows live return vs invested and your all-time high; above a profit hurdle (default +20% over basis) a configurable slice of new-high gains is locked out of the budget (never re-bet), so peaks survive the next drawdown without choking compounding near breakeven. Withdrawals stay on polymarket.com — your custody; the bot still contains zero transfer code
+- **Per-trader Kelly sizing + horizon** — each roster entry can carry its own measured net edge (scout adds arm it automatically with the pipeline's pessimistic estimate) and its own days-out cap; the Kelly rule f\*(p)=ê·p/(1−p) then stakes more where the measured edge is stronger
+- **Investment panel + profit banking** — set your cost basis and the dashboard shows live return vs invested and your all-time high; above a profit hurdle (default +20% over basis) a configurable slice of new-high gains is locked out of the budget (never re-bet), so peaks survive the next drawdown without choking compounding near breakeven. Top-ups are auto-detected on-chain (plain `transfer()` sends only — exchange settlements route through Polymarket's contracts and can't masquerade as deposits) and move the basis and hurdle with them. Withdrawals stay on polymarket.com — your custody; the bot still contains zero transfer code
 - **Auto take-profit** — open positions are market-sold when the mid reaches 0.95 (near-certainty: the last cents aren't worth in-play reversal risk) or gains 120% over entry (both configurable, 0 = off) — the rode-to-$88-and-round-tripped failure mode gets *realized* instead of just marked
 - **Light & dark themes** — CSS-variable UI with a one-click toggle, follows your OS preference by default
 - **Chain-level reconciliation** — detects zero-filled FAK orders and auto-swept resolved positions by reading balances and the Conditional Tokens payout vector straight from Polygon, so the ledger stays true even when every Polymarket API is blind (negRisk markets)
 - **Multi-trader with attribution** — every copy, skip and log line names which target it came from
-- **Built-in trader scout** — one click re-runs the whole selection pipeline against the live leaderboard and ranks candidates by friction-adjusted net copy edge, with per-row copy buttons; results stream in as each trader is analyzed
+- **Built-in trader scout** — one click re-runs the whole selection pipeline against the live leaderboard and ranks candidates by friction-adjusted net copy edge, with per-row copy buttons; results stream in as each trader is analyzed. It also re-runs itself on a schedule (default weekly — regimes end) and logs what passed; candidates are **never** auto-added
 - **Copy buttons + green tint** — missed trades (bot offline, restart baseline) appear in the live feed; rows that would genuinely copy glow green, and one click replays them through the exact same gates — per-row or all displayed at once ("copy all shown")
 - **Native app or headless** — pywebview window on desktop, `--headless` for a VPS under systemd (`vps/` has the full bootstrap: service unit, setup script, API-driven server provisioning)
 - **Claude copilot** — `claude -p` with a live bot-state snapshot; explains trades/skips and can tune settings via a whitelisted action protocol (it can never place trades or read the key)
-- **Observability** — on-chain wallet panel (cash + positions + P&L, including API-blind holdings), persistent trade history, external watchdog script (health, connection, missed-trade audit) suitable for cron
+- **Key in the OS vault** — the private key lives in Windows Credential Manager / macOS Keychain / Secret Service (write verified by read-back before the plaintext is purged); only a box with no vault at all falls back to the gitignored plaintext config
+- **Observability + self-heal** — on-chain wallet panel (cash + positions + P&L, including API-blind holdings), persistent trade history, external watchdog script (health, connection, missed-trade audit) suitable for cron, and `watchdog_heal.ps1` for Task Scheduler: if the dashboard stops serving, the app is relaunched within 10 minutes with no human in the loop
 - **Self-testing** — `--check` runs an offline suite of ledger/gate/UI unit tests; the deploy script refuses to ship if it fails
 
 ## Run
@@ -688,15 +708,23 @@ identical UI at `http://127.0.0.1:8777`.
 tagged releases build **Windows / macOS / Linux** binaries automatically via
 GitHub Actions (`.github/workflows/release.yml`) and attach them to the
 Releases page. Config and state persist next to the app file — keep it in its
-own folder, and remember the config holds your key: same custody rules as the
-source version.
+own folder. The key goes to the OS credential vault exactly as in the source
+version: same custody rules.
 
-Configure everything in the UI (http://127.0.0.1:8777 when headless). Config —
-including the private key, by explicit owner's choice — persists to
-`copybot_config.json`: **gitignored, never committed** (the full git history is
-scanned for key material as part of the release checklist), plaintext,
-single-user machine assumption. Use a dedicated wallet holding only what you
-can afford to lose.
+Configure everything in the UI (http://127.0.0.1:8777 when headless). Config
+persists to `copybot_config.json`: **gitignored, never committed** (the full
+git history is scanned for key material as part of the release checklist).
+The private key is stored in the **OS credential vault** — Windows Credential
+Manager / macOS Keychain / Secret Service — with a verified read-back before
+any plaintext is purged; only a box with no vault at all (bare headless Linux)
+falls back to the plaintext config file, by explicit owner's choice. Use a
+dedicated wallet holding only what you can afford to lose.
+
+Ops extras: `python tools/refresh_results.py` regenerates the results table
+above from the audited ledger; on Windows,
+`schtasks /Create /TN CopybotWatchdog /SC MINUTE /MO 10 /F /TR "powershell -NoProfile -ExecutionPolicy Bypass -File C:\path\to\watchdog_heal.ps1"`
+registers the self-heal task (cron + `watchdog_heal` logic works the same
+anywhere).
 
 For a $5/mo always-on deployment see `vps/`: `provision.ps1` creates the server
 through the Hetzner API, `setup.sh` bootstraps it (venv, firewall = SSH only,
@@ -715,16 +743,19 @@ any release.
   transmitted, never logged, never included in the copilot's context.
 - The web UI's key field is **write-only**: the served HTML never echoes the
   stored key (enforced by a self-test that fails the build if it ever does).
-- Storage is a gitignored local file; this repo's **entire git history is
-  scanned for the key value in all encodings** as part of the release
+- Storage is the OS credential vault (Credential Manager / Keychain / Secret
+  Service), written with a verified read-back; only a vault-less box falls
+  back to a gitignored local file. Either way this repo's **entire git history
+  is scanned for the key value in all encodings** as part of the release
   checklist — it has never touched a commit.
 
 **The bot can't move your funds anywhere.**
 - Grep the file: there is no transfer, no withdrawal, no
-  `eth_sendRawTransaction` — the only Polygon RPC calls are read-only
-  `eth_call`s (balances and the Conditional Tokens payout vector). The
-  worst-case blast radius of a bug is *bad trades within the budget caps*,
-  not exfiltrated funds.
+  `eth_sendRawTransaction` — every Polygon RPC call is read-only (`eth_call`
+  for balances and the Conditional Tokens payout vector; `eth_getLogs` /
+  `eth_getTransactionByHash` / `eth_blockNumber` for the deposit watcher,
+  which only *reads* transfers, never makes one). The worst-case blast radius
+  of a bug is *bad trades within the budget caps*, not exfiltrated funds.
 
 **Bounded egress.** The complete list of hosts the bot ever contacts:
 `*.polymarket.com` (data, gamma, lb, user-pnl, CLOB REST + WebSocket) and two
@@ -752,3 +783,7 @@ begins — size the wallet so the worst case is a shrug.
 This is a hobby project that trades real money badly or well depending on the
 week. Prediction markets are gambling-adjacent. Past performance of a week-long
 World-Cup-season sample predicts nothing. Run it with money you can lose.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
