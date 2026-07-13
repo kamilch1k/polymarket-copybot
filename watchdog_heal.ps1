@@ -12,7 +12,9 @@ if ($r -and $r.StatusCode -eq 200) { exit 0 }   # serving = alive enough
 if (Get-CimInstance Win32_Process -Filter "Name LIKE 'powershell%'" |
         Where-Object { $_.CommandLine -match 'deploy\.ps1' }) { exit 0 }
 
-Get-Process pythonw | Stop-Process -Force        # clear any wedged zombie first
+Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe'" |
+    Where-Object { $_.CommandLine -match 'copybot\.py' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }   # OUR zombie only — quotebot runs as pythonw too
 Start-Sleep 2
 Start-Process -FilePath "C:\Users\rewwe\AppData\Local\Programs\Python\Python312\pythonw.exe" `
     -ArgumentList "`"$PSScriptRoot\copybot.py`"" -WorkingDirectory $PSScriptRoot

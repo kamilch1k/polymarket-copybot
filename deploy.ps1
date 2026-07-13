@@ -20,7 +20,10 @@ if ($dirty) {
 }
 
 # 3) relaunch the app so the running process matches the code on disk
-Get-Process pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -Confirm:$false
+# (kill by command line: quotebot shares the pythonw binary, never touch it)
+Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'copybot\.py' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Confirm:$false }
 Start-Sleep 2
 Start-Process -FilePath "C:\Users\rewwe\AppData\Local\Programs\Python\Python312\pythonw.exe" `
     -ArgumentList "`"$PSScriptRoot\copybot.py`"" -WorkingDirectory $PSScriptRoot
