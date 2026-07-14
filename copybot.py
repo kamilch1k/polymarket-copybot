@@ -1775,7 +1775,10 @@ def _chat_card():
 
 
 def _fmt_ends(p):
-    """'2026-07-20 · 17d left' | 'today!' | 'ended — resolving' | 'settled'."""
+    """'2026-07-20 · 17d left' | 'today!' | 'ended — resolving' | 'settled'.
+    A listed end date far in the past on a live position is Polymarket's stale
+    creation-time estimate (resolution follows the QUESTION, not this field) —
+    say so instead of pretending the market is 'resolving' for months."""
     ed = (p.get("endDate") or "")[:10]
     if not ed:
         return "?"
@@ -1786,6 +1789,10 @@ def _fmt_ends(p):
         return ed
     if p.get("redeemable"):
         return f"{ed} · settled"
+    if days < -1:
+        return (f'<span title="Polymarket\'s endDate is a creation-time estimate, not enforced — '
+                f'this market trades until its question resolves (see the title\'s deadline)">'
+                f'listed {ed} · ⚠ date stale</span>')
     if days < 0:
         return f"{ed} · resolving"
     if days == 0:
@@ -3138,6 +3145,11 @@ def _check():
     assert "$28.50 cash (pUSD)" in card and "$34.50 total" in card
     assert "17d left" in card and "(+20.0%)" in card          # countdown + pnl%
     assert "1 settled/worthless positions hidden" in card      # dust collapsed
+    # a live position whose listed end is months past = stale metadata, said honestly
+    STATE["wallet"]["positions"].append({"title": "Stale politics", "outcome": "No", "size": 6,
+                                         "avgPrice": 0.85, "curPrice": 0.86, "currentValue": 5.2,
+                                         "cashPnl": 0.1, "percentPnl": 1.0, "endDate": "2026-03-31"})
+    assert "date stale" in _wallet_card() and "resolving" not in _wallet_card()
     STATE["wallet"] = {"usdc": 0.0, "checked": "0x" + "b" * 40, "positions": []}
     assert "empty on-chain" in _wallet_card()  # wrong-wallet warning fires
 
