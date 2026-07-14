@@ -196,6 +196,49 @@ def event_key(title):
     return head if " vs" in head else str(title or "").strip().lower()
 
 
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ("january", "february", "march", "april", "may", "june", "july",
+     "august", "september", "october", "november", "december"))}
+
+
+def title_deadline(title, today=None):
+    """Best-effort deadline parsed from a market QUESTION ('…by December 31',
+    '…before 2027', '…in July') — the thing Polymarket actually resolves by
+    when the listed endDate has gone stale. None when the title names no date.
+    Missing year = the next time that date occurs."""
+    import calendar
+    import datetime
+    t = (title or "").lower()
+    today = today or datetime.date.today()
+    mon = "|".join(MONTHS)
+    m = re.search(rf"\b(?:by|before|on|until)\s+({mon})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s*(\d{{4}}))?", t)
+    if m:
+        mo, day = MONTHS[m.group(1)], int(m.group(2))
+        yr = int(m.group(3)) if m.group(3) else today.year
+        try:
+            d = datetime.date(yr, mo, day)
+        except ValueError:
+            return None
+        if not m.group(3) and d < today:
+            d = datetime.date(yr + 1, mo, day)
+        return d.isoformat()
+    m = re.search(rf"\b(?:in|by|before)\s+({mon})\s*(\d{{4}})?", t)  # month only → its last day
+    if m:
+        mo = MONTHS[m.group(1)]
+        yr = int(m.group(2)) if m.group(2) else today.year
+        d = datetime.date(yr, mo, calendar.monthrange(yr, mo)[1])
+        if not m.group(2) and d < today:
+            d = datetime.date(yr + 1, mo, calendar.monthrange(yr + 1, mo)[1])
+        return d.isoformat()
+    m = re.search(r"\bbefore\s+(\d{4})\b", t)
+    if m:
+        return f"{int(m.group(1)) - 1}-12-31"
+    m = re.search(r"\b(?:by|in)\s+(\d{4})\b", t)
+    if m:
+        return f"{m.group(1)}-12-31"
+    return None
+
+
 def copy_stats(feed):
     trades = [t for t in feed if t.get("side")]
     if not trades:
@@ -1790,6 +1833,16 @@ def _fmt_ends(p):
     if p.get("redeemable"):
         return f"{ed} · settled"
     if days < -1:
+        guess = title_deadline(p.get("title"))
+        if guess:
+            try:
+                dleft = (datetime.date.fromisoformat(guess) - datetime.date.today()).days
+                left = f" · {dleft}d left" if dleft > 0 else ""
+            except ValueError:
+                left = ""
+            return (f'<span title="listed end {ed} is stale (Polymarket\'s endDate is an unenforced '
+                    f'creation-time estimate) — this deadline is parsed from the question text">'
+                    f'~{guess}{left} · per question</span>')
         return (f'<span title="Polymarket\'s endDate is a creation-time estimate, not enforced — '
                 f'this market trades until its question resolves (see the title\'s deadline)">'
                 f'listed {ed} · ⚠ date stale</span>')
@@ -3145,11 +3198,27 @@ def _check():
     assert "$28.50 cash (pUSD)" in card and "$34.50 total" in card
     assert "17d left" in card and "(+20.0%)" in card          # countdown + pnl%
     assert "1 settled/worthless positions hidden" in card      # dust collapsed
-    # a live position whose listed end is months past = stale metadata, said honestly
+    # deadlines parsed from question text (what markets actually resolve by)
+    _d = _dt.date(2026, 7, 14)
+    assert title_deadline("SAVE Act becomes law by December 31, 2026?", _d) == "2026-12-31"
+    assert title_deadline("GOP uses 'Nuclear Option' to break filibuster by December 31", _d) == "2026-12-31"
+    assert title_deadline("Will X leave before March 1?", _d) == "2027-03-01"  # passed → next year
+    assert title_deadline("Will Y happen before 2027?", _d) == "2026-12-31"
+    assert title_deadline("Bitcoin above $200k in 2026?", _d) == "2026-12-31"
+    assert title_deadline("Will WTI Crude Oil hit $80 in July?", _d) == "2026-07-31"
+    assert title_deadline("France vs. Spain: O/U 2.5", _d) is None
+    # a live position whose listed end is months past = stale metadata: show the
+    # question's deadline when parseable, an honest warning when not
     STATE["wallet"]["positions"].append({"title": "Stale politics", "outcome": "No", "size": 6,
                                          "avgPrice": 0.85, "curPrice": 0.86, "currentValue": 5.2,
                                          "cashPnl": 0.1, "percentPnl": 1.0, "endDate": "2026-03-31"})
-    assert "date stale" in _wallet_card() and "resolving" not in _wallet_card()
+    STATE["wallet"]["positions"].append({"title": "SAVE Act becomes law by December 31, 2026?",
+                                         "outcome": "No", "size": 6, "avgPrice": 0.85,
+                                         "curPrice": 0.86, "currentValue": 5.2, "cashPnl": 0.1,
+                                         "percentPnl": 1.0, "endDate": "2026-04-30"})
+    card = _wallet_card()
+    assert "date stale" in card and "resolving" not in card
+    assert "~2026-12-31" in card and "per question" in card
     STATE["wallet"] = {"usdc": 0.0, "checked": "0x" + "b" * 40, "positions": []}
     assert "empty on-chain" in _wallet_card()  # wrong-wallet warning fires
 
