@@ -111,6 +111,7 @@ STATE = {
     "who": {},                   # token -> trader we copied the open position from
     "last_scout": 0.0,           # when the weekly auto-scout last ran (persisted across restarts)
     "dep_block": 0,              # deposit watcher's chain cursor (last scanned Polygon block)
+    "pnl_curve": [],             # owner's 30d P&L points for the invest-panel sparkline (cosmetic)
     "hwm": 0.0,                  # all-time-high wallet equity (cash + positions) — display truth
     "banked": 0.0,               # profit locked at new highs — the cap never redeploys it
     "bank_base": 0.0,            # level up to which profit has been banked (≠ hwm: small gains
@@ -871,6 +872,24 @@ def fetch_wallet():
         STATE["wallet"].update(w)
 
 
+def fetch_pnl_curve():
+    """Owner's 30d P&L points for the invest-panel sparkline (same public
+    endpoint the trader analysis uses). Cosmetic: failures leave it numeric."""
+    funder = STATE.get("funder") or os.environ.get("PM_FUNDER")
+    if not funder:
+        return
+    try:
+        c = requests.get("https://user-pnl-api.polymarket.com/user-pnl",
+                         params={"user_address": funder, "interval": "1m", "fidelity": "1d"},
+                         timeout=15).json()
+        pts = [float(p["p"]) for p in sorted(c, key=lambda p: p["t"])]
+        if len(pts) >= 2:
+            with LOCK:
+                STATE["pnl_curve"] = pts
+    except Exception:
+        pass
+
+
 def fetch_name(addr):
     try:
         r = requests.get(f"{GAMMA_API}/public-profile", params={"address": addr}, timeout=10)
@@ -1229,13 +1248,26 @@ def sell_position(tid):
         logline(kind="error", side="SELL", name=name, note=str(ex)[:140])
 
 
+def best_bid(tid):
+    """Top of the actual bid book — what a market SELL can really hit.
+    None when the book is unreadable (caller decides the fallback)."""
+    try:
+        r = requests.get(f"{CLOB_HOST}/book", params={"token_id": tid}, timeout=5).json()
+        bids = r.get("bids") or []
+        return max(float(b["price"]) for b in bids) if bids else None
+    except Exception:
+        return None
+
+
 def take_profits():
     """Owner-requested auto-sell: realize winners instead of round-tripping them.
-    A copied position is market-sold when its mid has either reached TP_PRICE
-    (near-certainty — the remaining cents aren't worth in-play reversal risk,
-    and freed capital re-deploys: g ∝ 1/τ) or gained TP_GAIN_PCT% over entry.
-    Uses the exact same sell path as the wallet-card button; sells are gated
-    live-only there. Dry copies and unknown-basis positions ride to resolution."""
+    A copied position is market-sold when the BEST BID has either reached
+    TP_PRICE (near-certainty — the remaining cents aren't worth in-play
+    reversal risk, and freed capital re-deploys: g ∝ 1/τ) or gained
+    TP_GAIN_PCT% over entry. Bid, not midpoint: a sell fills into bids, and a
+    phantom mid spike on a thin book must not trigger a dump into nothing
+    (midpoint only as fallback when the book endpoint hiccups). Uses the same
+    sell path as the wallet-card button; sells are gated live-only there."""
     if TP_PRICE <= 0 and TP_GAIN_PCT <= 0:
         return
     with LOCK:
@@ -1246,14 +1278,14 @@ def take_profits():
         if not cost or sh <= 0:
             continue
         entry = cost / sh
-        mid = midpoint(tid)
-        if not mid:
+        px = best_bid(tid) or midpoint(tid)
+        if not px:
             continue
-        hit_price = TP_PRICE > 0 and mid >= TP_PRICE
-        hit_gain = TP_GAIN_PCT > 0 and entry > 0 and mid >= entry * (1 + TP_GAIN_PCT / 100)
+        hit_price = TP_PRICE > 0 and px >= TP_PRICE
+        hit_gain = TP_GAIN_PCT > 0 and entry > 0 and px >= entry * (1 + TP_GAIN_PCT / 100)
         if hit_price or hit_gain:
-            why = (f"mid {mid:.2f} ≥ {TP_PRICE:.2f}" if hit_price
-                   else f"mid {mid:.2f} = {mid / entry:.1f}× entry {entry:.2f}")
+            why = (f"bid {px:.2f} ≥ {TP_PRICE:.2f}" if hit_price
+                   else f"bid {px:.2f} = {px / entry:.1f}× entry {entry:.2f}")
             logline(kind="live", side="SELL", name=STATE["names"].get(tid, tid[:14]),
                     note=f"take-profit: {why} — selling to lock it in")
             sell_position(tid)
@@ -1576,6 +1608,7 @@ def bot_loop():
                 with LOCK:
                     STATE["leaders"] = leaders
             watch_deposits()  # ~5 min cadence is plenty for spotting top-ups
+            fetch_pnl_curve()
         fetch_wallet()
         settle_resolved()
         reconcile_ghosts()
@@ -1916,11 +1949,26 @@ def _invest_card():
         else:
             bank_bit = (f'banking starts above ${hurdle_lv:,.2f} '
                         f'(+{BANK_HURDLE_PCT:g}% over basis) — then {BANK_PCT:g}% of gains get locked')
+        with LOCK:
+            pts = list(STATE.get("pnl_curve") or [])
+        spark = ""
+        if len(pts) >= 2:
+            lo, hi = min(pts + [0.0]), max(pts)
+            span = (hi - lo) or 1.0
+            w, h = 560, 44
+            xy = " ".join(f"{8 + (w - 16) * i / (len(pts) - 1):.1f},"
+                          f"{5 + (h - 10) * (hi - v) / span:.1f}" for i, v in enumerate(pts))
+            scol = "var(--ok)" if pts[-1] >= pts[0] else "var(--bad)"
+            zero_y = 5 + (h - 10) * hi / span
+            spark = (f'<svg viewBox="0 0 {w} {h}" style="width:100%;height:44px;margin-top:6px" '
+                     f'title="Polymarket 30-day P&L curve">'
+                     f'<line x1=8 y1={zero_y:.1f} x2={w - 8} y2={zero_y:.1f} stroke="var(--line)"/>'
+                     f'<polyline points="{xy}" fill="none" stroke="{scol}" stroke-width="2"/></svg>')
         body = (f'<div style=margin-bottom:4px>invested <b>${INVESTED:,.2f}</b> → now '
                 f'<b>${total:,.2f}</b> <span style=color:{col}>({pnl:+,.2f} · {pct:+.1f}%)</span> '
                 f'· all-time high ${hwm:,.2f}</div>'
                 f'<div class=dim>{bank_bit} · still in play ${at_risk:,.2f} · '
-                f'withdraw any time on polymarket.com — your wallet, your custody</div>')
+                f'withdraw any time on polymarket.com — your wallet, your custody</div>{spark}')
     return f'<div class=card style=margin-bottom:16px><h2 style=margin-top:0>My investment</h2>{body}</div>'
 
 
@@ -2070,11 +2118,28 @@ def _scout_deep(c):
             known += 1
             short += 1  # negRisk sports: same-day by construction
     short_pct = round(100 * short / known) if known else 0
+    # category mix: the World Cup ends — the re-pick must see WHAT they trade,
+    # not just how well. Dollar-weighted over the week's fills.
+    cats = {"sports": 0.0, "crypto": 0.0, "politics": 0.0, "other": 0.0}
+    for a in fills:
+        t = (a.get("title") or "").lower()
+        usd = float(a.get("usdcSize") or 0)
+        if any(kk.lower() in t for kk in SPORTY):
+            cats["sports"] += usd
+        elif any(kk in t for kk in ("bitcoin", "ethereum", "solana", "up or down", "crypto", "$btc", "$eth")):
+            cats["crypto"] += usd
+        elif any(kk in t for kk in ("election", "president", "fed ", "rate", "senate", "governor",
+                                    "government", "war", "tariff", "ceasefire", "nominee", "invade")):
+            cats["politics"] += usd
+        else:
+            cats["other"] += usd
+    dom = max(cats, key=cats.get)
+    cat = f"{dom} {round(100 * cats[dom] / vol)}%" if vol else "—"
     net = _net_edge(pnl7, c["d30"], vol, sell_ratio)
     verdict = ("mm-bot — uncopyable" if od > 300 or (med < 20 and od > 120) else
                "long-horizon" if short_pct < 55 else
                "PASS" if net and net[0] > 0 else "edge ≈ 0 after friction")
-    return {**c, "pnl7": round(pnl7), "vol7": round(vol), "od": od,
+    return {**c, "pnl7": round(pnl7), "vol7": round(vol), "od": od, "cat": cat,
             "sell": round(100 * sell_ratio), "short": short_pct, "net": net, "verdict": verdict}
 
 
@@ -2167,18 +2232,18 @@ def _scout_card():
         rows += (f'<tr><td>{html.escape(str(r["name"]))[:20]}</td>'
                  f'<td class=r>${r["d30"]:,}</td><td class=r>${r.get("vol7", 0):,}</td>'
                  f'<td class=r>{r.get("od", "—")}</td><td class=r>{r.get("sell", "—")}%</td>'
-                 f'<td class=r>{r.get("short", "—")}%</td><td class=r>{net}</td>'
+                 f'<td class=r>{r.get("short", "—")}%</td><td>{r.get("cat", "—")}</td><td class=r>{net}</td>'
                  f'<td style="color:{vcol.get(r.get("verdict"), "#fbbf24")}">{r.get("verdict", "")}</td>'
                  f'<td>{act}</td></tr>')
     if not rows:
-        rows = ('<tr><td colspan=9 class=dim>'
+        rows = ('<tr><td colspan=10 class=dim>'
                 + ("scanning — results appear as each trader finishes…" if s["running"] else
                    "not run yet — the scan is read-only, takes ~2–3 min, and ranks the current "
                    "leaderboard by friction-adjusted copy edge (the math in the README)")
                 + "</td></tr>")
     return (f'<h2>Trader scout — who is worth copying right now</h2><div class=card>{btn}{note}'
             f'<table><tr><th>trader</th><th class=r>30d pnl</th><th class=r>7d vol</th>'
-            f'<th class=r>ord/d</th><th class=r>sell%</th><th class=r>≤2d%</th>'
+            f'<th class=r>ord/d</th><th class=r>sell%</th><th class=r>≤2d%</th><th>mix</th>'
             f'<th class=r>net copy edge</th><th>verdict</th><th></th></tr>{rows}</table></div>')
 
 
@@ -2803,6 +2868,9 @@ def _check():
     STATE["wallet"] = {"usdc": 20.0, "positions": [{"currentValue": 11.47}]}
     card = _invest_card()
     assert "$31.47" in card and "+4.9%" in card and "$90.00" in card and "$27.00" in card
+    STATE["pnl_curve"] = [0.0, 5.0, 3.0, 8.0]
+    assert "<polyline" in _invest_card()  # 30d sparkline renders once the curve is known
+    STATE["pnl_curve"] = []
     STATE["banked"] = 0.0
     assert "banking starts above $36.00" in _invest_card()  # hurdle surfaced before first lock
     globals()["INVESTED"] = 0.0
@@ -2812,22 +2880,29 @@ def _check():
     assert STATE["banked"] == 0.0 and STATE["hwm"] == 31.0
     STATE["hwm"] = 0.0
 
-    # auto take-profit: price-hit and gain-hit sell, in-band positions ride on
+    # auto take-profit: fires on the BEST BID (a sell hits bids — phantom mid
+    # spikes must not trigger); midpoint only as book-outage fallback
     tp_calls = []
-    _osp, _omid2 = sell_position, midpoint
+    _osp, _omid2, _obb = sell_position, midpoint, best_bid
     globals()["sell_position"] = lambda t: tp_calls.append(t)
-    globals()["midpoint"] = lambda t: {"tpA": 0.97, "tpB": 0.70, "tpC": 0.60}.get(t)
+    globals()["best_bid"] = lambda t: {"tpA": 0.97, "tpB": 0.70, "tpC": 0.60}.get(t)
+    globals()["midpoint"] = lambda t: 0.99  # a lying mid must NOT matter while bids exist
     globals()["TP_PRICE"], globals()["TP_GAIN_PCT"] = 0.95, 100.0
     STATE["holdings"].update({"tpA": 2.0, "tpB": 2.0, "tpC": 2.0})
     STATE["live_cost"].update({"tpA": 1.0, "tpB": 0.6, "tpC": 1.0})  # entries 0.50 / 0.30 / 0.50
     take_profits()
-    assert tp_calls == ["tpA", "tpB"], tp_calls  # 0.97 ≥ price TP; 0.70 = 2.3× entry ≥ gain TP; tpC holds
+    assert tp_calls == ["tpA", "tpB"], tp_calls  # bid 0.97 ≥ price TP; 0.70 = 2.3× entry; tpC holds despite mid 0.99
+    tp_calls.clear()
+    globals()["best_bid"] = lambda t: None      # book unreadable → midpoint fallback engages
+    globals()["midpoint"] = lambda t: {"tpA": 0.97}.get(t)
+    take_profits()
+    assert tp_calls == ["tpA"], tp_calls
     globals()["TP_PRICE"], globals()["TP_GAIN_PCT"] = 0.0, 0.0
     tp_calls.clear()
     take_profits()
     assert tp_calls == []  # both knobs off -> feature fully dormant
     globals()["TP_PRICE"], globals()["TP_GAIN_PCT"] = 0.95, 120.0
-    globals()["sell_position"], globals()["midpoint"] = _osp, _omid2
+    globals()["sell_position"], globals()["midpoint"], globals()["best_bid"] = _osp, _omid2, _obb
     for k in ("tpA", "tpB", "tpC"):
         STATE["holdings"].pop(k, None)
         STATE["live_cost"].pop(k, None)
@@ -3103,10 +3178,11 @@ def _check():
     assert _curve_screen([0, 1e3]) is None                                   # too short
     SCOUT["rows"] = [{"addr": "0x" + "9" * 40, "name": "TestGuy", "d30": 50000, "green": 60,
                       "mdd": 100, "pnl7": 9000, "vol7": 80000, "od": 12.0, "sell": 5,
-                      "short": 95, "net": (0.05, 0.2), "verdict": "PASS"}]
+                      "short": 95, "cat": "crypto 81%", "net": (0.05, 0.2), "verdict": "PASS"}]
     card = _scout_card()
     assert "TestGuy" in card and "+5% … +20%" in card and "/target" in card and "PASS" in card
     assert 'name=edge value="5.0"' in card  # PASS button arms sizing with the measured edge
+    assert "crypto 81%" in card  # category mix visible — the post-WC repick needs WHAT they trade
     SCOUT["rows"] = []
 
     # the settings form must NEVER echo the stored key back into served HTML
