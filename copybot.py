@@ -1289,18 +1289,36 @@ def sell_position(tid):
         p = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=tid,
                                    signature_type=SIGNATURE_TYPE)
         cl.update_balance_allowance(p)  # sync CLOB's cached balance with the chain
-        held = int(float(cl.get_balance_allowance(p).get("balance", 0)) / 1e4) / 100.0
+        read = lambda: int(float(cl.get_balance_allowance(p).get("balance", 0)) / 1e4) / 100.0
+        held = read()
+        if held <= 0:  # the sync lags the chain a beat right after fills — one more look
+            time.sleep(1.5)
+            cl.update_balance_allowance(p)
+            held = read()
         if held <= 0:
             logline(kind="error", side="SELL", name=name, note="chain reports 0 balance for this token")
             return
-        ref = midpoint(tid) or float(pos.get("curPrice") or 0)
+        # price off the actual top BID: on a thin book the midpoint sits far above
+        # where sells can fill, and mid-based FAKs die unfilled (the 'first try
+        # does nothing' failure). limit_price() then crosses below this.
+        ref = best_bid(tid) or midpoint(tid) or float(pos.get("curPrice") or 0)
         if not ref:
             logline(kind="error", side="SELL", name=name, note="no market price available")
             return
-        if _order(tid, "SELL", held, ref, name):
+        ok = _order(tid, "SELL", held, ref, name)
+        if not ok:
+            time.sleep(1.2)  # the book breathed — re-read the bid, cross deeper once
+            ref2 = (best_bid(tid) or ref) * 0.99
+            logline(kind="skip", side="SELL", name=name,
+                    note=f"didn't fill — retrying once, deeper ({ref2:.3f})")
+            ok = _order(tid, "SELL", held, ref2, name)
+        if ok:
             with LOCK:
                 STATE["holdings"].pop(tid, None)
             save_state()
+        else:
+            logline(kind="error", side="SELL", name=name,
+                    note="retry didn't fill either — book too thin right now, try again in a minute")
     except Exception as ex:
         logline(kind="error", side="SELL", name=name, note=str(ex)[:140])
 
@@ -2471,7 +2489,7 @@ def render_dyn():
   {toggle}
   <button onclick="var r=document.documentElement,t=r.dataset.theme==='light'?'dark':'light';r.dataset.theme=t;localStorage.theme=t"
           title="switch light / dark theme">◐</button>
-  <form method=post action=/kill style=display:inline onsubmit="return confirm('Kill the bot?')"><button class=kill>Kill</button></form>
+  <form method=post action=/kill data-nav style=display:inline onsubmit="return confirm('Kill the bot?')"><button class=kill>Kill</button></form>
 </div>
 {errbar}
 {_chat_card()}
@@ -2591,7 +2609,35 @@ setInterval(function() {{
     .then(function(h) {{ document.getElementById('dyn').innerHTML = h; }})
     .catch(function() {{}});
 }}, 3000);
+// action buttons submit IN PLACE: no page reload, no scroll-to-top, and the
+// outcome is announced by a centered toast instead of a line lost at the top.
+function toast(msg) {{
+  var t = document.getElementById('toast');
+  if (!t) {{ t = document.createElement('div'); t.id = 'toast'; document.body.appendChild(t); }}
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast._h); toast._h = setTimeout(function() {{ t.classList.remove('show'); }}, 3200);
+}}
+document.getElementById('dyn').addEventListener('submit', function(e) {{
+  var f = e.target;
+  // data-nav forms (Kill) navigate classically; cancelled confirm()s already prevented
+  if (f.dataset.nav !== undefined || e.defaultPrevented) return;
+  e.preventDefault();
+  var btn = f.querySelector('button'), label = btn ? btn.textContent.trim() : 'action';
+  if (btn) {{ btn.disabled = true; btn.textContent = '…'; }}
+  fetch(f.getAttribute('action'), {{method: 'POST', body: new URLSearchParams(new FormData(f))}})
+    .then(function() {{ toast('✓ ' + label + ' sent — result lands in the activity log'); return fetch('/dyn'); }})
+    .then(function(r) {{ return r.text(); }})
+    .then(function(h) {{ document.getElementById('dyn').innerHTML = h; }})
+    .catch(function() {{ toast('✗ ' + label + ' failed — is the bot up?');
+      if (btn) {{ btn.disabled = false; btn.textContent = label; }} }});
+}});
 </script>
+<style>
+#toast{{position:fixed;left:50%;bottom:22%;transform:translateX(-50%);background:var(--card);
+color:var(--text);border:1px solid var(--line);border-radius:10px;padding:11px 20px;font-weight:600;
+opacity:0;pointer-events:none;transition:opacity .25s;z-index:99;box-shadow:0 8px 28px rgba(0,0,0,.45);max-width:80vw}}
+#toast.show{{opacity:1}}
+</style>
 </body></html>"""
 
 
@@ -3167,6 +3213,53 @@ def _check():
     STATE["live"] = False
     sell_position("tok9")
     assert "DRY mode" in STATE["log"][0]["note"]
+
+    # live sell: prices off the real BID (a lying thin-book mid is ignored),
+    # survives balance-sync lag, and retries one level deeper before giving up
+    _obb2, _omid3, _oord2, _ogc3 = best_bid, midpoint, _order, get_client
+
+    class _SellCl:
+        bals = ["5500000"]  # 5.5 shares on the first read
+
+        def update_balance_allowance(self, p):
+            pass
+
+        def get_balance_allowance(self, p):
+            return {"balance": _SellCl.bals.pop(0) if _SellCl.bals else "5500000"}
+    refs = []
+    globals()["get_client"] = lambda: _SellCl()
+    globals()["best_bid"] = lambda t: 0.80
+    globals()["midpoint"] = lambda t: 0.99
+    globals()["_order"] = lambda tid, side, sh, ref, name, drift=None, who="": \
+        (refs.append((round(ref, 4), sh)), True)[1]
+    STATE["live"] = True
+    STATE["wallet"] = {"positions": [{"asset": "sx", "title": "SX", "outcome": "Yes", "curPrice": 0.5}]}
+    STATE["holdings"]["sx"] = 5.5
+    sell_position("sx")
+    assert refs == [(0.80, 5.5)], refs           # bid-priced, chain-read size
+    assert "sx" not in STATE["holdings"]
+    refs.clear()
+    fail_first = {"n": 0}
+
+    def _flaky(tid, side, sh, ref, name, drift=None, who=""):
+        refs.append(round(ref, 4))
+        fail_first["n"] += 1
+        return fail_first["n"] > 1               # first FAK dies, retry fills
+    globals()["_order"] = _flaky
+    STATE["holdings"]["sx"] = 5.5
+    STATE["wallet"] = {"positions": [{"asset": "sx", "title": "SX", "outcome": "Yes", "curPrice": 0.5}]}
+    sell_position("sx")
+    assert refs == [0.80, round(0.80 * 0.99, 4)], refs  # deeper second cross
+    assert "sx" not in STATE["holdings"]
+    assert any("retrying once" in (e.get("note") or "") for e in list(STATE["log"])[:4])
+    STATE["live"] = False
+    globals()["best_bid"], globals()["midpoint"] = _obb2, _omid3
+    globals()["_order"], globals()["get_client"] = _oord2, _ogc3
+
+    # page shell: in-place action submits + centered toast; Kill opts out
+    shell = render()
+    assert "defaultPrevented" in shell and "#toast" in shell and "toast(" in shell
+    assert "data-nav" in render_dyn()  # the Kill form keeps classic navigation
     STATE["wallet"] = {}
     page = render()
     assert "copybot" in page and "Settings" in page and "leaderboard" in page and "Trade history" in page
