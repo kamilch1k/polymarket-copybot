@@ -1081,7 +1081,9 @@ POLL_FAILS = {}        # target -> consecutive poll failures (transient resets s
 
 
 def market_end_ts(tid):
-    """Epoch when this token's market ends (gamma lookup, cached). None = unknown."""
+    """Epoch when this token's market ends (gamma lookup, cached). None = unknown.
+    Failures are NOT cached — one gamma hiccup must not blind the horizon gate
+    for that token forever."""
     if tid in ENDS_CACHE:
         return ENDS_CACHE[tid]
     ts = None
@@ -1092,8 +1094,9 @@ def market_end_ts(tid):
             from datetime import datetime
             ts = datetime.fromisoformat(e).timestamp()
     except Exception:
-        pass  # unknown horizon copies through: missing data must not silence the bot
-    ENDS_CACHE[tid] = ts
+        pass
+    if ts is not None:
+        ENDS_CACHE[tid] = ts
     return ts
 
 
@@ -1132,10 +1135,21 @@ def handle(trade):
             days = TDAYS.get(pw, MAX_DAYS_OUT)  # per-trader horizon beats the global
             if days > 0:
                 ets = market_end_ts(tid)
-                if ets and (ets - time.time()) > days * 86400:
+                now_ts = time.time()
+                # fail CLOSED while the cap is armed: no end date, or an "end"
+                # more than a day in the past on a still-trading market (stale
+                # gamma metadata — a Dec-31 politics market claimed to end in
+                # March and months-out buys walked through the cap). The 1-day
+                # grace keeps in-play matches running past their scheduled end
+                # copyable.
+                if ets is None or ets < now_ts - 86400:
+                    logline(kind="skip", side="BUY", name=name, who=who,
+                            note="horizon cap armed but the market's end date is missing/garbage — not copying blind")
+                    return
+                if (ets - now_ts) > days * 86400:
                     whose = "this trader's" if pw in TDAYS else "your"
                     logline(kind="skip", side="BUY", name=name, who=who,
-                            note=f"resolves in {(ets - time.time()) / 86400:.0f}d — beyond {whose} {days:g}d horizon")
+                            note=f"resolves in {(ets - now_ts) / 86400:.0f}d — beyond {whose} {days:g}d horizon")
                     return
             if MAX_LEGS_PER_EVENT > 0:
                 ev = event_key(name.rpartition(" — ")[0])
@@ -2733,6 +2747,11 @@ def _check():
     assert limit_price(0.99, "BUY") == 0.99
     assert limit_price(0.505, "BUY", 0.001) == 0.516   # sub-cent tick honored
     assert limit_price(0.505, "SELL", 0.001) == 0.494
+    # horizon lookups never cache failures (one gamma hiccup ≠ permanent gate blindness)
+    _orget = requests.get
+    requests.get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline"))
+    assert market_end_ts("zzz-unknown") is None and "zzz-unknown" not in ENDS_CACHE
+    requests.get = _orget
     assert not ready()  # nothing configured
     global MODE
     STATE["live"] = False
@@ -2768,6 +2787,19 @@ def _check():
     globals()["market_end_ts"] = lambda tid: time.time() + 30 * 86400
     handle({"asset": "t6", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q6", "outcome": "Yes"})
     assert "horizon" in STATE["log"][0]["note"] and STATE["holdings"].get("t6") is None
+    # fail CLOSED while armed: unknown end date refuses to copy blind…
+    globals()["market_end_ts"] = lambda tid: None
+    handle({"asset": "t6b", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q6b", "outcome": "Yes"})
+    assert "missing/garbage" in STATE["log"][0]["note"] and STATE["holdings"].get("t6b") is None
+    # …and so does a stale past end on a still-trading market (the Dec-31
+    # politics markets that claimed to end in March walked through here)
+    globals()["market_end_ts"] = lambda tid: time.time() - 90 * 86400
+    handle({"asset": "t6c", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q6c", "outcome": "Yes"})
+    assert "missing/garbage" in STATE["log"][0]["note"] and STATE["holdings"].get("t6c") is None
+    # in-play grace: an hour past the scheduled end (overtime) still copies
+    globals()["market_end_ts"] = lambda tid: time.time() - 3600
+    handle({"asset": "t6d", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q6d", "outcome": "Yes"})
+    assert STATE["holdings"].get("t6d", 0) > 0
     globals()["market_end_ts"] = lambda tid: time.time() + 3600
     handle({"asset": "t7", "side": "BUY", "price": 0.5, "size": 1000, "title": "Q7",
             "outcome": "Yes", "_who": "guyX"})
