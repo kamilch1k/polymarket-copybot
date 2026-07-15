@@ -421,6 +421,7 @@ def load_state():
     STATE["hwm"] = s.get("hwm", 0.0)
     STATE["banked"] = s.get("banked", 0.0)
     STATE["bank_base"] = s.get("bank_base", 0.0)
+    STATE["capital_recovered"] = s.get("capital_recovered", False)
     # backfill attribution for positions bought before the who-map existed:
     # BUY history entries have carried the trader name since day one
     bywho = {e.get("name"): e["who"] for e in STATE["history"]
@@ -439,7 +440,8 @@ def save_state():
                 "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"],
                 "bought_at": STATE["bought_at"], "who": STATE["who"],
                 "last_scout": STATE["last_scout"], "dep_block": STATE["dep_block"],
-                "hwm": STATE["hwm"], "banked": STATE["banked"], "bank_base": STATE["bank_base"]}
+                "hwm": STATE["hwm"], "banked": STATE["banked"], "bank_base": STATE["bank_base"],
+                "capital_recovered": STATE.get("capital_recovered", False)}
     STATE_FILE.write_text(json.dumps(data))
 
 
@@ -810,15 +812,31 @@ def reconcile_odometer():
     return released
 
 
+def bank_rate(profit_pct):
+    """Marginal % of a gain that gets locked away, RISING with how far above
+    your basis you are. Below the hurdle: nothing. Then BANK_PCT up to +50%,
+    stepped up past +50% and +100% — so an $88 spike banks far more of its top
+    than its middle, which is exactly the money a drawdown would otherwise give
+    back. Base rate stays your setting; the escalation only bites on real gains."""
+    if profit_pct < BANK_HURDLE_PCT:
+        return 0.0
+    if profit_pct < 50:
+        return BANK_PCT
+    if profit_pct < 100:
+        return min(95.0, BANK_PCT + 20)
+    return min(97.0, BANK_PCT + 35)
+
+
 def bank_profits(total):
-    """Hurdled profit skim. The display high-water mark always tracks equity;
-    banking is separate and stricter: it starts only above basis+hurdle (no
-    strangling the budget while barely above water, where variance recrosses
-    basis constantly), and it locks BANK_PCT% of gains above 'bank_base' — the
-    level already banked up to. Sub-$0.50 skims accumulate (bank_base doesn't
-    advance) instead of leaking away as dust. Banked money never redeploys —
-    that's what makes rode-to-$88-back-to-$31 keep a chunk, not a story."""
+    """Hurdled, PROGRESSIVE profit skim. The display high-water mark always
+    tracks equity; banking is separate and stricter: it starts only above
+    basis+hurdle, and locks bank_rate()% of gains above 'bank_base' (the level
+    already banked up to) — a rising fraction the higher you climb. Sub-$0.50
+    skims accumulate instead of leaking as dust. Banked money never redeploys.
+    Fires the 'capital recovered' milestone the first time banked ≥ invested:
+    from then on you are playing purely with house money."""
     added = 0.0
+    milestone = False
     with LOCK:
         if total > STATE["hwm"] + 0.005:
             STATE["hwm"] = round(total, 2)
@@ -826,16 +844,28 @@ def bank_profits(total):
             base = max(STATE["bank_base"], INVESTED * (1 + BANK_HURDLE_PCT / 100))
             gain = total - base
             if gain > 0:
-                add = round(gain * BANK_PCT / 100, 2)
-                if add >= 0.50:  # ponytail: fixed $0.50 step; scale-aware step if bankrolls grow
+                # rate at the current profit level applied to the new gain — a
+                # close, monotone approximation to integrating the tier schedule
+                # (moves are small between 15s polls). ponytail: exact integral
+                # only matters if a single poll ever leaps a whole tier.
+                prof_pct = (total - INVESTED) / INVESTED * 100
+                add = round(gain * bank_rate(prof_pct) / 100, 2)
+                if add >= 0.50:
                     STATE["banked"] = round(STATE["banked"] + add, 2)
                     STATE["bank_base"] = round(total, 2)
                     added = add
+                    if not STATE.get("capital_recovered") and STATE["banked"] >= INVESTED:
+                        STATE["capital_recovered"] = True
+                        milestone = True
     if added:
         # hist=True: every lock is a money event — keep it auditable across restarts
         logline(hist=True, kind="live", side="BANK",
                 note=f"profit banked: ${added:.2f} locked at new high ${total:.2f} "
                      f"(banked total ${STATE['banked']:.2f} — never re-bet)")
+        if milestone:
+            logline(hist=True, kind="live", side="BANK",
+                    note=f"🏦 CAPITAL RECOVERED — banked ${STATE['banked']:.2f} now covers your "
+                         f"${INVESTED:.2f} invested. Everything still in play is house money.")
         save_state()
     return added
 
@@ -1539,7 +1569,7 @@ def apply_actions(acts):
             elif op == "mode" and v in ("auto", "approve"):
                 MODE = v
                 applied.append(f"mode={v}")
-            elif op in ("fraction", "cap", "min_his", "slippage", "bankroll"):
+            elif op in ("edge", "kelly", "cap", "min_his", "slippage", "bankroll"):
                 v = float(v)
                 if op == "edge":
                     globals()["EDGE_EST"] = v
@@ -1616,7 +1646,7 @@ RECENT CONVERSATION:
 
 You can control the bot. If — and only if — the owner asks for a change, end your reply with one final line:
 ACTIONS: [{{"op": "...", "value": ...}}]
-Allowed ops: live (true/false) · mode ("auto"/"approve") · fraction (number) · cap ($) · min_his ($) · slippage (0-1) · bankroll ($) · add_target ("0x...") · drop_target ("0x...").
+Allowed ops: live (true/false) · mode ("auto"/"approve") · edge (%) · kelly (0-1) · cap ($) · min_his ($) · slippage (0-1) · bankroll ($) · add_target ("0x...") · drop_target ("0x...").
 If no change was requested, end with exactly: ACTIONS: []
 
 OWNER: {q}"""
@@ -2068,13 +2098,21 @@ def _invest_card():
         col = "var(--ok)" if pnl >= 0 else "var(--bad)"
         at_risk = max(0.0, total - banked)
         hurdle_lv = INVESTED * (1 + BANK_HURDLE_PCT / 100)
+        recovered = STATE.get("capital_recovered") or banked >= INVESTED > 0
         if BANK_PCT <= 0:
             bank_bit = "profit banking off"
         elif banked:
-            bank_bit = f'banked profit <b>${banked:,.2f}</b> (locked at highs, never re-bet)'
+            if recovered:
+                safe = f'🏦 <b style=color:var(--ok)>capital recovered</b> — banked ${banked:,.2f} covers your ${INVESTED:,.2f}; the rest is house money'
+            else:
+                pctback = banked / INVESTED * 100 if INVESTED else 0
+                safe = (f'banked <b>${banked:,.2f}</b> — <b>{pctback:.0f}%</b> of your ${INVESTED:,.2f} locked safe '
+                        f'(${max(0, INVESTED - banked):,.2f} more banks back your whole stake)')
+            bank_bit = safe + ' · never re-bet'
         else:
             bank_bit = (f'banking starts above ${hurdle_lv:,.2f} '
-                        f'(+{BANK_HURDLE_PCT:g}% over basis) — then {BANK_PCT:g}% of gains get locked')
+                        f'(+{BANK_HURDLE_PCT:g}% over basis) — then {BANK_PCT:g}% of gains lock, rising to '
+                        f'{min(97, BANK_PCT + 35):g}% on bigger runs')
         with LOCK:
             pts = list(STATE.get("pnl_curve") or [])
         spark = ""
@@ -3023,31 +3061,40 @@ def _check():
     TARGETS.remove(_ta)
     assert "no targets yet" in _roster_card()
 
-    # profit banking: hurdled, dust-accumulating, display-mark decoupled
+    # profit banking: hurdled, PROGRESSIVE (rate rises with profit), dust-accumulating
+    assert bank_rate(10) == 0.0 and bank_rate(30) == 50.0   # below hurdle none; base tier 50%
+    assert bank_rate(60) == 70.0 and bank_rate(150) == 85.0  # +50%→+20pp, +100%→+35pp
     globals()["INVESTED"], globals()["BANK_PCT"], globals()["BANK_HURDLE_PCT"] = 30.0, 50.0, 20.0
     STATE["hwm"], STATE["banked"], STATE["bank_base"] = 0.0, 0.0, 0.0
+    STATE["capital_recovered"] = False
     bank_profits(31.0)   # above basis but below the +20% hurdle ($36): mark moves, nothing locks
     assert STATE["banked"] == 0.0 and STATE["hwm"] == 31.0
-    bank_profits(88.0)   # above hurdle: lock 50% of (88 − 36)
-    assert STATE["banked"] == 26.0 and STATE["bank_base"] == 88.0 and STATE["hwm"] == 88.0
+    bank_profits(88.0)   # +193% profit → 85% of (88 − 36) = 44.20 locked, milestone fires
+    assert STATE["banked"] == 44.2 and STATE["bank_base"] == 88.0 and STATE["hwm"] == 88.0
+    assert STATE["capital_recovered"]  # 44.20 banked ≥ 30 invested → house money
     bank_profits(31.0)   # drawdown: bank and base hold, mark holds
-    assert STATE["banked"] == 26.0 and STATE["bank_base"] == 88.0
-    bank_profits(88.5)   # new high but the skim (< $0.50) accumulates instead of dust-locking
-    assert STATE["banked"] == 26.0 and STATE["bank_base"] == 88.0 and STATE["hwm"] == 88.5
-    bank_profits(90.0)   # accumulated gain over the base finally locks
-    assert STATE["banked"] == 27.0 and STATE["bank_base"] == 90.0
-    # invest card: full numbers when the basis is set, a setup nag when it isn't
+    assert STATE["banked"] == 44.2 and STATE["bank_base"] == 88.0
+    bank_profits(88.5)   # new high but the 85%×0.5 = 0.43 skim (< $0.50) accumulates
+    assert STATE["banked"] == 44.2 and STATE["bank_base"] == 88.0 and STATE["hwm"] == 88.5
+    bank_profits(90.0)   # accumulated gain over the base finally clears the step: +$1.70
+    assert STATE["banked"] == 45.9 and STATE["bank_base"] == 90.0
+    # invest card: house-money milestone shows once banked ≥ invested
     STATE["wallet"] = {"usdc": 20.0, "positions": [{"currentValue": 11.47}]}
     card = _invest_card()
-    assert "$31.47" in card and "+4.9%" in card and "$90.00" in card and "$27.00" in card
+    assert "$31.47" in card and "+4.9%" in card and "capital recovered" in card
     STATE["pnl_curve"] = [0.0, 5.0, 3.0, 8.0]
     assert "<polyline" in _invest_card()  # 30d sparkline renders once the curve is known
     STATE["pnl_curve"] = []
+    # partial-savings display: banked < invested shows the % locked + what's left
+    STATE["banked"], STATE["capital_recovered"] = 12.0, False
+    part = _invest_card()
+    assert "of your $30.00 locked safe" in part and "$18.00 more" in part and ">40%<" in part
     STATE["banked"] = 0.0
     assert "banking starts above $36.00" in _invest_card()  # hurdle surfaced before first lock
     globals()["INVESTED"] = 0.0
     assert "Settings" in _invest_card()
     STATE["hwm"], STATE["banked"], STATE["bank_base"], STATE["wallet"] = 0.0, 0.0, 0.0, {}
+    STATE["capital_recovered"] = False
     bank_profits(31.0)  # cost basis unset: the mark tracks, nothing banks
     assert STATE["banked"] == 0.0 and STATE["hwm"] == 31.0
     STATE["hwm"] = 0.0
@@ -3168,6 +3215,11 @@ def _check():
     assert set(apply_actions(acts)) == {"mode=approve", "cap=3"}
     assert MODE == "approve" and MAX_USDC_PER_TRADE == 3.0
     MODE, globals()["MAX_USDC_PER_TRADE"] = "auto", 5.0
+    # edge & kelly reach their handlers (regression: the branch tuple once listed
+    # a dead 'fraction' op, so these two were silently unreachable)
+    assert set(apply_actions([{"op": "edge", "value": 7}, {"op": "kelly", "value": 0.6}])) == {"edge=7", "kelly=0.6"}
+    assert EDGE_EST == 7.0 and KELLY_MULT == 0.6
+    globals()["EDGE_EST"], globals()["KELLY_MULT"] = 5.0, 0.5
     assert apply_actions([{"op": "rm -rf", "value": 1}, "junk"]) == []  # non-whitelisted ignored
     assert parse_actions("no control line at all")[1] == []
     assert json.dumps(bot_context())  # snapshot is JSON-serializable
