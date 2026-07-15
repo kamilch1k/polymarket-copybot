@@ -448,8 +448,11 @@ def save_state():
                 "capital_recovered": STATE.get("capital_recovered", False)}
     blob = json.dumps(data)
     # atomic write: a crash mid-write must not truncate the file into invalid JSON
-    # that load_state then dies on at boot.
-    tmp = STATE_FILE.with_suffix(".tmp")
+    # that load_state then dies on at boot. UNIQUE temp name per call — save_state
+    # runs from several threads at once, and a shared temp path makes one thread's
+    # os.replace pull the file out from under another's (FileNotFoundError → the
+    # very thread-death this guards against).
+    tmp = STATE_FILE.with_name(f"{STATE_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(blob)
     os.replace(tmp, STATE_FILE)
 
@@ -3484,6 +3487,29 @@ def _check():
     load_chat()
     assert any(m["text"] == "does the chat save?" for m in STATE["chat"])
     CHAT_FILE.unlink(missing_ok=True)
+    # save_state is thread-safe: many concurrent writers (unique temp names) must
+    # never collide into FileNotFoundError, and the file stays valid JSON. Also a
+    # writer racing a mutator must not raise "dict changed size" (copy-under-lock).
+    STATE["holdings"] = {f"t{i}": float(i) for i in range(50)}
+    STATE["capital_recovered"] = True
+    stop = {"go": True}
+
+    def _mutate():
+        i = 0
+        while stop["go"]:
+            with LOCK:
+                STATE["holdings"][f"m{i % 200}"] = 1.0
+                STATE["holdings"].pop(f"m{(i + 7) % 200}", None)
+            i += 1
+    _ms = [threading.Thread(target=_mutate, daemon=True) for _ in range(2)]
+    for _t in _ms:
+        _t.start()
+    for _ in range(60):
+        save_state()  # would raise if the temp path collided or a dict mutated mid-dump
+    stop["go"] = False
+    time.sleep(0.05)
+    assert json.loads(STATE_FILE.read_text())["capital_recovered"] is True  # valid JSON, round-trips
+    STATE["holdings"] = {}
     dyn = render_dyn()
     assert "Status" in dyn and "Test connection" in dyn and "❌" in dyn  # unconfigured -> red rows
     assert "Your wallet" in dyn and "no open positions on-chain" in dyn

@@ -1,5 +1,6 @@
 copybot_config.json
 copybot_state.json
+copybot_state.json.*.tmp
 copybot_chat.jsonl
 copybot_preview.html
 __pycache__/
