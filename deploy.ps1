@@ -25,8 +25,10 @@ Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe'" -ErrorAction Silent
     Where-Object { $_.CommandLine -match 'copybot\.py' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Confirm:$false }
 Start-Sleep 2
+# headless: the managed bot never owns a window — windows are disposable second
+# instances (desktop shortcut), so closing one can't kill the bot anymore
 Start-Process -FilePath "C:\Users\rewwe\AppData\Local\Programs\Python\Python312\pythonw.exe" `
-    -ArgumentList "`"$PSScriptRoot\copybot.py`"" -WorkingDirectory $PSScriptRoot
+    -ArgumentList "`"$PSScriptRoot\copybot.py`" --headless" -WorkingDirectory $PSScriptRoot
 Start-Sleep 8
 
 # 4) prove it came back

@@ -16,6 +16,8 @@ Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe'" |
     Where-Object { $_.CommandLine -match 'copybot\.py' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force }   # OUR zombie only — quotebot runs as pythonw too
 Start-Sleep 2
+# headless: a background resurrection must never pop a window (the user closing
+# a surprise window is exactly what used to kill the bot into a heal loop)
 Start-Process -FilePath "C:\Users\rewwe\AppData\Local\Programs\Python\Python312\pythonw.exe" `
-    -ArgumentList "`"$PSScriptRoot\copybot.py`"" -WorkingDirectory $PSScriptRoot
+    -ArgumentList "`"$PSScriptRoot\copybot.py`" --headless" -WorkingDirectory $PSScriptRoot
 Add-Content "$PSScriptRoot\watchdog_heal.log" "$(Get-Date -Format s) dashboard was down - relaunched"

@@ -3513,9 +3513,10 @@ if __name__ == "__main__":
         import webview  # native desktop window (Windows WebView2)
         webview.create_window("Copybot", url, width=1180, height=920)
         webview.start()          # returns when the window is closed
-        os._exit(0)              # window closed = app quits, bot stops
-    except ImportError:
-        webbrowser.open(url)     # fallback: browser tab
-        if server:
+        os._exit(0)              # window closed = THIS process quits (the managed
+        #                          bot runs --headless, so closing a window is safe)
+    except Exception:            # any webview failure (not just a missing module):
+        webbrowser.open(url)     # under pythonw it would die silently — show a
+        if server:               # browser tab instead so launching always shows something
             while True:
                 time.sleep(3600)
