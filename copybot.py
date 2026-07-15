@@ -2,7 +2,7 @@
 """
 Polymarket copy-trading bot + local dashboard app.
 
-Run it, a browser opens http://127.0.0.1:8777 . Configure everything in the page
+Run it, a native window (or browser tab, headless) opens on http://127.0.0.1:8777 . Configure everything in the page
 (⚙ Settings): target wallet, your funder wallet, private key, and sizing. Then
 click Go LIVE. It shows what the bot holds / wants to buy, your target's live
 activity + how to copy him best, and a leaderboard of traders to one-click copy.
@@ -16,7 +16,7 @@ verified write; only a box with no vault at all falls back to the plaintext
 config, by the owner's choice. Configure once, runs forever.
 
 SETUP
-  pip install py-clob-client-v2 requests websocket-client
+  pip install -r requirements.txt     (or the bot self-installs missing deps)
 RUN
   python copybot.py --check     offline self-check
   python copybot.py             start app; browser opens; configure in the page
@@ -57,9 +57,9 @@ TDAYS = {}                    # per-trader horizon override, addr(lower) -> days
 SCOUT_EVERY_DAYS = 7.0        # auto-rerun the trader scout every N days (0 = manual button only)
 MAX_LEGS_PER_EVENT = 2       # max open BUY legs per match/event (0 = uncapped) — same-match
                              # legs are near-perfectly correlated: m legs act as ONE bet at m× size
-TP_PRICE = 0.95              # auto take-profit: sell when a position's mid reaches this price
+TP_PRICE = 0.95              # auto take-profit: sell when a position's best bid reaches this price
                              # (the last cents aren't worth in-play reversal risk; 0 = off)
-TP_GAIN_PCT = 120.0          # auto take-profit: sell when the mid gained ≥N% over our entry
+TP_GAIN_PCT = 120.0          # auto take-profit: sell when the best bid gained ≥N% over our entry
                              # (rode-to-$88 positions get REALIZED, not just marked; 0 = off)
 INVESTED = 0.0               # owner's cost basis (set in Settings) — powers the My-investment panel
 BANK_PCT = 50.0              # % of new profit locked out of the budget (0 = off):
@@ -74,7 +74,7 @@ LEADERS_EVERY = 20            # refresh leaderboard every N polls (~5 min)
 SIGNATURE_TYPE = 3            # 1 = old email/magic · 2 = browser wallet · 3 = new Polymarket wallet (2026+). Auto-detected.
 PORT = 8777
 HEADLESS = False              # set by --headless: no window, systemd owns the lifecycle
-PRIVATE_KEY_MEM = None        # persisted to config by owner's choice (single-user PC)
+PRIVATE_KEY_MEM = None        # in OS credential vault; plaintext config only if no vault (owner's choice)
 # packaged as a one-file app, __file__ is a transient extraction dir — persist
 # config/state next to the executable instead so they survive relaunches
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
@@ -434,15 +434,24 @@ def load_state():
 
 
 def save_state():
+    # COPY every mutable container INSIDE the lock: json.dumps runs after the lock
+    # releases, and a concurrent trade mutating a shared dict mid-serialization
+    # throws "dict changed size during iteration" — which, in the lock-free
+    # bot_loop, kills the polling/settlement/take-profit thread silently.
     with LOCK:
-        data = {"seen": sorted(STATE["seen"]), "holdings": STATE["holdings"],
-                "names": STATE["names"], "history": STATE["history"][-500:],
-                "spent_live": STATE["spent_live"], "live_cost": STATE["live_cost"],
-                "bought_at": STATE["bought_at"], "who": STATE["who"],
+        data = {"seen": sorted(STATE["seen"]), "holdings": dict(STATE["holdings"]),
+                "names": dict(STATE["names"]), "history": list(STATE["history"][-500:]),
+                "spent_live": STATE["spent_live"], "live_cost": dict(STATE["live_cost"]),
+                "bought_at": dict(STATE["bought_at"]), "who": dict(STATE["who"]),
                 "last_scout": STATE["last_scout"], "dep_block": STATE["dep_block"],
                 "hwm": STATE["hwm"], "banked": STATE["banked"], "bank_base": STATE["bank_base"],
                 "capital_recovered": STATE.get("capital_recovered", False)}
-    STATE_FILE.write_text(json.dumps(data))
+    blob = json.dumps(data)
+    # atomic write: a crash mid-write must not truncate the file into invalid JSON
+    # that load_state then dies on at boot.
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(blob)
+    os.replace(tmp, STATE_FILE)
 
 
 LEDGER_AUDIT_0707 = [  # chain-verified 2026-07-07: "never filled" ghosts that were real fills
@@ -607,12 +616,21 @@ def watch_deposits():
         return
     with LOCK:
         STATE["dep_block"] = latest
-    if got >= 0.5:  # dust below this isn't a deposit, it's noise
-        globals()["INVESTED"] = round(INVESTED + got, 2)
+        if got >= 0.5:  # dust below this isn't a deposit, it's noise
+            # a deposit is NEW PRINCIPAL, not profit. Raise the banking watermarks
+            # by the same amount so bank_profits doesn't skim fresh capital as
+            # "gain" (the 15s banking poll runs before this 5-min one), and so the
+            # capital-recovered milestone can't false-fire on a top-up.
+            globals()["INVESTED"] = round(INVESTED + got, 2)
+            STATE["bank_base"] = round(STATE["bank_base"] + got, 2) if STATE["bank_base"] else 0.0
+            STATE["hwm"] = round(STATE["hwm"] + got, 2) if STATE["hwm"] else 0.0
+    if got >= 0.5:
         save_config()
+        save_state()  # persist dep_block + watermarks NOW: a Kill before the loop's
+        #               end-of-cycle save would rescan the window and double-count
         logline(hist=True, kind="live", side="DEPOSIT",
                 note=f"+${got:.2f} deposit detected on-chain — invested basis now ${INVESTED:.2f} "
-                     "(banking hurdle moved with it)")
+                     "(banking hurdle + watermarks moved with it, so it's not skimmed as profit)")
 
 
 def onchain_usdc(addr):
@@ -679,7 +697,11 @@ def _cond_of(tid):
                 break
     except Exception:
         pass
-    return COND_CACHE.setdefault(tid, (None, None))
+    # NEVER cache a miss: one truncated scan (network blip, or the fill older than
+    # the 1000-row window) would otherwise poison this token forever, defeating the
+    # we-filled guard in reconcile_ghosts and re-opening the 0707 "bogus refund"
+    # hole. A real fill populates COND_CACHE above; a miss just retries next time.
+    return COND_CACHE.get(tid, (None, None))
 
 
 def _ctf_payout(tid):
@@ -1068,20 +1090,30 @@ def _order(tid, side, shares, ref, name, drift=None, who=""):
     with LOCK:
         live = STATE["live"]
         STATE["copies"] += 1
+    reserved = 0.0  # budget pre-charged for a live BUY; refunded if it doesn't fill
     if live and side == "BUY":
+        # RESERVE inside one LOCK: check headroom, clip, and charge spent_live
+        # atomically. Otherwise two buys on different threads (ws + poll + HTTP)
+        # both read the same headroom and each posts — overspending the hard cap.
+        clip_note = hardstop = None
         with LOCK:
             headroom = round(SPEND_CAP - STATE["spent_live"], 2)
-        want = round(price * shares, 2)
-        if want > headroom + 1e-9:
-            if headroom >= MIN_NOTIONAL:
-                # deploy the last budget dollars as a clipped copy instead of skipping
-                shares = round(headroom / price, 2)
-                logline(kind="skip", side="BUY", name=name,
-                        note=f"budget clip: ${want:.2f} → ${headroom:.2f} to fit the ${SPEND_CAP:.2f} cap")
-            else:
-                logline(kind="skip", side="BUY", name=name,
-                        note=f"HARD STOP: ${STATE['spent_live']:.2f} of ${SPEND_CAP:.2f} budget spent")
-                return False
+            want = round(price * shares, 2)
+            if want > headroom + 1e-9:
+                if headroom >= MIN_NOTIONAL:
+                    shares = round(headroom / price, 2)
+                    want = round(price * shares, 2)
+                    clip_note = f"budget clip: to ${want:.2f} to fit the ${SPEND_CAP:.2f} cap"
+                else:
+                    hardstop = f"HARD STOP: ${STATE['spent_live']:.2f} of ${SPEND_CAP:.2f} budget spent"
+            if not hardstop:
+                reserved = want
+                STATE["spent_live"] = round(STATE["spent_live"] + reserved, 2)
+        if hardstop:
+            logline(kind="skip", side="BUY", name=name, note=hardstop)
+            return False
+        if clip_note:
+            logline(kind="skip", side="BUY", name=name, note=clip_note)
     kind, note = "dry", ""
     if live:
         from py_clob_client_v2.clob_types import (OrderArgs, MarketOrderArgs, OrderType,
@@ -1116,22 +1148,29 @@ def _order(tid, side, shares, ref, name, drift=None, who=""):
                 kind, note = "error", f"exchange rejected: {str(err)[:120]}"
                 if side == "BUY":
                     FAILED_BUY_AT[tid] = time.time()
+                    if reserved:  # release the reservation — nothing filled
+                        with LOCK:
+                            STATE["spent_live"] = round(max(0.0, STATE["spent_live"] - reserved), 2)
+                        reserved = 0.0
             else:
                 oid = str(resp.get("orderID", "")) if isinstance(resp, dict) else ""
                 note = f"✓ order placed{' — ' + oid[:10] + '…' if oid else ''} @ {price}"
                 kind = "live"
-                with LOCK:  # cap tracks net $ in play: buys add, sell proceeds refund
-                    delta = price * shares if side == "BUY" else -price * shares
-                    STATE["spent_live"] = round(max(0.0, STATE["spent_live"] + delta), 2)
-                    if side == "BUY":  # remember which holdings cost live money (for resolve credit)
-                        STATE["live_cost"][tid] = round(STATE["live_cost"].get(tid, 0.0) + price * shares, 2)
+                with LOCK:  # BUY spend was already reserved above; SELL refunds proceeds
+                    if side == "BUY":
+                        STATE["live_cost"][tid] = round(STATE["live_cost"].get(tid, 0.0) + reserved, 2)
                     else:
+                        STATE["spent_live"] = round(max(0.0, STATE["spent_live"] - price * shares), 2)
                         STATE["live_cost"].pop(tid, None)  # we always exit the whole position
         except Exception as ex:
             if "no orders found" in str(ex):  # FAK into a torn-down book: benign, no $ moved
                 kind, note = "skip", "book empty — FAK found nothing to match (market closing?)"
             else:
                 kind, note = "error", str(ex)[:140]
+            if reserved:  # any exception before a confirmed fill releases the reservation
+                with LOCK:
+                    STATE["spent_live"] = round(max(0.0, STATE["spent_live"] - reserved), 2)
+                reserved = 0.0
             if side == "BUY":
                 FAILED_BUY_AT[tid] = time.time()  # don't hammer a market that just rejected us
     e = {"d": time.strftime("%Y-%m-%d"), "t": time.strftime("%H:%M:%S"), "kind": kind,
@@ -1142,7 +1181,10 @@ def _order(tid, side, shares, ref, name, drift=None, who=""):
         STATE["history"].append(e)
         if side == "BUY" and who and kind in ("live", "dry"):
             STATE["who"][tid] = who  # remember whose trade this position mirrors
-    return kind in ("live", "dry")  # only an actually-placed order updates holdings
+    # return the ACTUAL shares placed (post budget-clip, post chain-balance clamp)
+    # so holdings match live_cost exactly — otherwise take-profit computes a wrong
+    # entry price and can market-sell an underwater position. False = nothing placed.
+    return shares if kind in ("live", "dry") else False
 
 
 def execute(it):
@@ -1156,9 +1198,10 @@ def execute(it):
         if shares <= 0:
             logline(kind="skip", side="SELL", name=it["name"], note="nothing left to sell")
             return
-    if _order(tid, side, shares, it["ref"], it["name"], it.get("drift"), it.get("who", "")):
+    filled = _order(tid, side, shares, it["ref"], it["name"], it.get("drift"), it.get("who", ""))
+    if filled:  # the real placed size, not the requested one (budget clip / balance clamp)
         with LOCK:
-            delta = shares if side == "BUY" else -shares
+            delta = filled if side == "BUY" else -filled
             STATE["holdings"][tid] = round(STATE["holdings"].get(tid, 0.0) + delta, 2)
             if side == "BUY":
                 STATE["bought_at"][tid] = time.time()
@@ -1216,6 +1259,14 @@ def handle(trade):
     with LOCK:
         STATE["names"][tid] = name
     if side == "BUY":
+        # cooldown is checked BEFORE the INFLIGHT marker is added: its early return
+        # sits above the try/finally, so adding the marker here would strand the
+        # token in INFLIGHT_BUYS forever (permanent no-stack skip + odometer
+        # release deadlock — the exact freeze reconcile_odometer exists to prevent).
+        if time.time() - FAILED_BUY_AT.get(tid, 0) < 90:
+            logline(kind="skip", side="BUY", name=name, who=who,
+                    note="cooling down — this market just rejected a buy")
+            return
         # one copy per market: his 82-fill burst is ONE order. INFLIGHT closes the
         # ws-thread/poll-thread race while the first copy's order is still placing.
         with LOCK:
@@ -1226,10 +1277,6 @@ def handle(trade):
         if dup:
             logline(kind="skip", side="BUY", name=name, who=who,
                     note="already holding/queued this market — not stacking copies")
-            return
-        if time.time() - FAILED_BUY_AT.get(tid, 0) < 90:
-            logline(kind="skip", side="BUY", name=name, who=who,
-                    note="cooling down — this market just rejected a buy")
             return
     try:
         if side == "BUY":
@@ -1748,12 +1795,15 @@ def bot_loop():
                     STATE["leaders"] = leaders
             watch_deposits()  # ~5 min cadence is plenty for spotting top-ups
             fetch_pnl_curve()
-        fetch_wallet()
-        settle_resolved()
-        reconcile_ghosts()
-        reconcile_odometer()  # floor to open stakes; release settled-loss cruft when flat
-        auto_cap()
-        take_profits()  # realize winners at TP thresholds instead of marking-and-hoping
+        # each maintenance step is isolated: a single transient failure (API blip,
+        # a mid-serialization race) must degrade to a logged error, never kill this
+        # thread — its death silently strands budget/settlement/take-profit.
+        for step in (fetch_wallet, settle_resolved, reconcile_ghosts,
+                     reconcile_odometer, auto_cap, take_profits):
+            try:
+                step()
+            except Exception as ex:
+                logline(kind="error", note=f"{step.__name__} hiccup (loop continues): {str(ex)[:90]}")
         if SCOUT_EVERY_DAYS > 0 and not SCOUT["running"] \
                 and time.time() - STATE["last_scout"] > SCOUT_EVERY_DAYS * 86400:
             with LOCK:  # stamp first so a crash can't turn into a scan loop
@@ -2431,7 +2481,7 @@ def _settings_form():
 <form method=post action=/settings class=settings>
   <label>Target wallet(s) — comma-separate for several<input name=target value="{', '.join(TARGETS)}" {_vstyle(TARGETS, True)} placeholder="0x…, 0x… (or click copy on leaderboard traders)"></label>
   <label>Funder wallet (your deposit address)<input name=funder value="{funder_val}" {_vstyle(funder_val, valid_addr(funder_val))} placeholder="0x…"></label>
-  <label>Private key (saved to copybot_config.json on this PC){key_note}<input name=private_key value="" {_vstyle(pk_val, bool(signer))} autocomplete=off placeholder="{'saved ✓ — leave blank to keep, paste to replace' if pk_val else '0x…'}"></label>
+  <label>Private key (stored in the OS credential vault; plaintext config only if no vault){key_note}<input name=private_key value="" {_vstyle(pk_val, bool(signer))} autocomplete=off placeholder="{'saved ✓ — leave blank to keep, paste to replace' if pk_val else '0x…'}"></label>
   <label>Mode (saves the instant you switch)<select name=mode onchange="this.form.submit()">
     <option value=auto {"selected" if MODE == "auto" else ""}>auto — copy instantly</option>
     <option value=approve {"selected" if MODE == "approve" else ""}>approve — I click ✓ per trade</option>
@@ -2448,10 +2498,10 @@ def _settings_form():
   <label>Max open legs per match/event <input name=max_legs_per_event value="{MAX_LEGS_PER_EVENT}"> (0 = uncapped — same-match legs are correlated: m legs ≈ one bet at m× size)</label>
   <label>Auto take-profit at price ≥ <input name=tp_price value="{TP_PRICE:g}"> (sell near-certain winners; 0 = off)</label>
   <label>Auto take-profit at gain ≥ <input name=tp_gain_pct value="{TP_GAIN_PCT:g}">% over entry (realize the spike instead of watching it round-trip; 0 = off)</label>
-  <label>I invested $<input name=invested value="{INVESTED:g}"> (cost basis — powers the My-investment panel)</label>
+  <label>I invested $<input name=invested value="{INVESTED:g}"><input type=hidden name=invested_was value="{INVESTED:g}"> (cost basis — powers the My-investment panel)</label>
   <label>Bank <input name=bank_pct value="{BANK_PCT:g}">% of new-high profit (0 = off; banked money is never re-bet)</label>
   <label>…but only above +<input name=bank_hurdle_pct value="{BANK_HURDLE_PCT:g}">% profit over basis (hurdle — don't choke the budget while barely above water)</label>
-  <label>Banked so far $<input name=banked value="{STATE['banked']:g}"> (grows automatically at new highs — lower it by hand after you withdraw)</label>
+  <label>Banked so far $<input name=banked value="{STATE['banked']:g}"><input type=hidden name=banked_was value="{STATE['banked']:g}"> (grows automatically at new highs — lower it by hand after you withdraw)</label>
   <label><span style="display:flex;align-items:center;gap:6px"><input type=checkbox id=acr_on style="width:auto;margin:0">
     Auto budget — cap = wallet total minus this $ reserve (uncheck for manual cap)</span>
     <input name=auto_cap_reserve id=acr value="{AUTO_CAP_RESERVE:g}"></label>
@@ -2876,13 +2926,21 @@ class Handler(BaseHTTPRequestHandler):
             globals()["SPEND_CAP"] = num("spend_cap", SPEND_CAP)
             globals()["MAX_DAYS_OUT"] = num("max_days_out", MAX_DAYS_OUT)
             globals()["MAX_LEGS_PER_EVENT"] = int(num("max_legs_per_event", MAX_LEGS_PER_EVENT))
-            globals()["INVESTED"] = num("invested", INVESTED)
+            # banked/invested grow on their own between page loads; the form is
+            # never live-refreshed, so its prefilled values are STALE. Apply them
+            # ONLY when the user actually edited the field (submitted ≠ rendered),
+            # else a Save that only tweaked slippage would silently roll back
+            # accrued banking (breaking "never re-bet") or corrupt the basis.
+            def changed(name, cur):
+                sub, was = num(name, cur), num(name + "_was", cur)
+                return sub if abs(sub - was) > 1e-9 else cur
+            globals()["INVESTED"] = changed("invested", INVESTED)
             globals()["BANK_PCT"] = num("bank_pct", BANK_PCT)
             globals()["BANK_HURDLE_PCT"] = num("bank_hurdle_pct", BANK_HURDLE_PCT)
             globals()["TP_PRICE"] = num("tp_price", TP_PRICE)
             globals()["TP_GAIN_PCT"] = num("tp_gain_pct", TP_GAIN_PCT)
             with LOCK:
-                STATE["banked"] = max(0.0, num("banked", STATE["banked"]))
+                STATE["banked"] = max(0.0, changed("banked", STATE["banked"]))
             save_state()
             globals()["AUTO_CAP_RESERVE"] = num("auto_cap_reserve", AUTO_CAP_RESERVE)
             globals()["AUTO_TRADE_PCT"] = num("auto_trade_pct", AUTO_TRADE_PCT)
@@ -3226,21 +3284,55 @@ def _check():
     # hard spend cap arithmetic
     STATE["spent_live"], globals()["SPEND_CAP"] = 19.50, 20.0
     assert not over_budget(0.49) and over_budget(0.51)
-    # partial headroom clips the copy to fit; dust headroom still hard-stops
+    # partial headroom clips the copy to fit; dust headroom still hard-stops.
+    # A clipped BUY must return the CLIPPED shares so holdings == live_cost/price
+    # (else take-profit reads a bogus entry and dumps an underwater position).
+    class _OkCl:  # accepts every order, so we can read the placed size back
+        def create_market_order(self, a): return "s"
+        def create_order(self, a): return "s"
+        def post_order(self, s, t): return {"errorMsg": "", "orderID": "0xok"}
+        def update_balance_allowance(self, p): return None
+        def get_balance_allowance(self, p): return {"balance": "0"}
     _ogc = get_client
+    globals()["get_client"] = lambda: _OkCl()
+    STATE["live"], STATE["spent_live"] = True, 18.5
+    STATE["live_cost"].pop("bh2", None)
+    # ref 0.50 crosses to a 0.51 limit; headroom $1.50 → 2.94 sh, cost $1.50
+    filled = _order("bh2", "BUY", 20.0, 0.5, "BH2 — Yes")
+    assert filled == 2.94 and any("budget clip" in (e.get("note") or "") for e in list(STATE["log"])[:3])
+    # holdings updated with the CLIPPED size → entry price matches the fill (~0.51),
+    # so take-profit can't misread the basis and dump an underwater position
+    STATE["holdings"]["bh2"] = round(STATE["holdings"].get("bh2", 0.0) + filled, 2)  # mirror execute()
+    assert abs(STATE["live_cost"]["bh2"] / STATE["holdings"]["bh2"] - 0.51) < 0.01
+    STATE["holdings"].pop("bh2", None); STATE["live_cost"].pop("bh2", None)
     globals()["get_client"] = lambda: (_ for _ in ()).throw(RuntimeError("offline"))
-    STATE["live"], STATE["spent_live"] = True, 8.0
-    _order("bh1", "BUY", 20.0, 0.5, "BH — Yes")   # wants ~$10.2, headroom $12 - fits? no: cap 20, spent 8
-    STATE["spent_live"] = 18.5
-    _order("bh2", "BUY", 20.0, 0.5, "BH2 — Yes")  # wants ~$10.2, headroom $1.50 → clipped
-    assert any("budget clip" in (e.get("note") or "") for e in list(STATE["log"])[:3])
     STATE["spent_live"] = 19.8
-    _order("bh3", "BUY", 20.0, 0.5, "BH3 — Yes")  # headroom $0.20 < $1 minimum → hard stop
+    assert _order("bh3", "BUY", 20.0, 0.5, "BH3 — Yes") is False  # headroom $0.20 < $1 → hard stop
     assert "HARD STOP" in STATE["log"][0]["note"]
+    # reservation closes the TOCTOU: a rejected buy's pre-charge is refunded, and a
+    # filled buy's charge already happened at reserve time (never double-counted)
+    STATE["spent_live"] = 0.0
+    _FakeClX = type("X", (), {"create_market_order": lambda s, a: "s",
+                              "post_order": lambda s, o, t: {"errorMsg": "nope", "orderID": ""}})
+    globals()["get_client"] = lambda: _FakeClX()
+    assert _order("rz", "BUY", 4.0, 0.5, "RZ — Yes") is False
+    assert STATE["spent_live"] == 0.0 and "rz" not in STATE["live_cost"]  # reservation refunded
+    _FakeClX.post_order = lambda s, o, t: {"errorMsg": "", "orderID": "0xz"}
+    assert _order("rz", "BUY", 4.0, 0.5, "RZ — Yes") == 4.0
+    assert abs(STATE["spent_live"] - STATE["live_cost"]["rz"]) < 1e-9  # charged once, exactly
     STATE["live"] = False
+    STATE["live_cost"].pop("rz", None)
     globals()["get_client"] = _ogc
     FAILED_BUY_AT.clear()
     STATE["spent_live"] = 0.0
+
+    # stale settings Save must NOT roll back banking that accrued since page-load:
+    # a field is applied only when submitted ≠ the hidden render-time "_was" value.
+    # (mirrors the handler's `changed()`; `cur` is the current live value = 40)
+    def changed_rule(submitted, was, cur):
+        return submitted if abs(submitted - was) > 1e-9 else cur
+    assert changed_rule(26.0, 26.0, 40.0) == 40.0   # untouched field: keep the accrued 40
+    assert changed_rule(12.0, 26.0, 40.0) == 12.0   # user lowered it (post-withdrawal): honor it
 
     # exchange responses: a non-empty errorMsg is a FAILURE (no spend counted, cooldown
     # set); a clean response renders human, not as a raw dict; legacy notes prettify
@@ -3253,11 +3345,11 @@ def _check():
         def post_order(self, s, t): return dict(_FakeCl.resp)
     globals()["get_client"] = lambda: _FakeCl()
     STATE["live"], STATE["spent_live"], globals()["SPEND_CAP"] = True, 0.0, 50.0
-    assert _order("em1", "BUY", 2.0, 0.5, "EM — Yes") is False
+    assert _order("em1", "BUY", 2.0, 0.5, "EM — Yes") is False  # rejection → nothing placed
     assert "exchange rejected" in STATE["log"][0]["note"] and STATE["spent_live"] == 0.0
     assert "em1" in FAILED_BUY_AT and "em1" not in STATE["live_cost"]
     _FakeCl.resp = {"errorMsg": "", "orderID": "0xabcdef123456"}
-    assert _order("em2", "BUY", 2.0, 0.5, "EM2 — Yes") is True
+    assert _order("em2", "BUY", 2.0, 0.5, "EM2 — Yes") == 2.0  # returns the ACTUAL shares placed
     assert "✓ order placed — 0xabcdef12…" in STATE["log"][0]["note"] and STATE["spent_live"] > 0
     assert _note("{'errorMsg': '', 'orderID': '0xf161...'}") == "✓ order placed"
     assert _note("resolved WON — freed") == "resolved WON — freed"  # real notes untouched
@@ -3519,6 +3611,7 @@ def _check():
     _orpc, fund = _rpc, "0x" + "f" * 40
     STATE["funder"], globals()["INVESTED"] = fund, 30.0
     STATE["dep_block"] = 100
+    STATE["bank_base"], STATE["hwm"] = 40.0, 45.0  # watermarks must move WITH a deposit
 
     def _fake_rpc(method, params):
         if method == "eth_blockNumber":
@@ -3533,7 +3626,10 @@ def _check():
     globals()["_rpc"] = _fake_rpc
     watch_deposits()
     assert INVESTED == 55.0 and STATE["dep_block"] == 120  # $25 direct send counted, fill ignored
+    # bank watermarks rose by the SAME $25 → the deposit can't be skimmed as profit
+    assert STATE["bank_base"] == 65.0 and STATE["hwm"] == 70.0
     assert any(e.get("side") == "DEPOSIT" for e in STATE["history"][-3:])
+    STATE["bank_base"], STATE["hwm"] = 0.0, 0.0
     globals()["_rpc"] = lambda m, p: hex(200) if m == "eth_blockNumber" else None
     watch_deposits()
     assert STATE["dep_block"] == 120                       # getLogs failed → cursor holds, retry next pass

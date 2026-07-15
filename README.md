@@ -12,11 +12,11 @@ with real (small) money. Everything below is from that live run.
 <!-- results:auto -->
 | Metric | Value (auto-refreshed from the live ledger by `tools/refresh_results.py`) |
 |---|---|
-| Balance at current marks (Jul 12, 2026 19:03) | **$46.48** — $46.48 cash + $0.00 in open positions (**+40% since the $33.11 start**) |
-| Cumulative P&L | **+13.37** at CLOB/data-api marks (Polymarket's hourly accounting lags unresolved legs) |
-| Settled copies | 56 — **32 won / 24 lost (57%)** — every settlement cross-checked against the on-chain payout vector |
-| Capital returned by settled wins | $159.23 |
-| Profit banked (locked out of the budget, never re-bet) | $3.44 |
+| Balance at current marks (Jul 15, 2026 19:35) | **$40.05** — $37.25 cash + $2.80 in open positions (**+21% since the $33.11 start**) |
+| Cumulative P&L | **+6.94** at CLOB/data-api marks (Polymarket's hourly accounting lags unresolved legs) |
+| Settled copies | 61 — **34 won / 27 lost (56%)** — every settlement cross-checked against the on-chain payout vector |
+| Capital returned by settled wins | $168.31 |
+| Profit banked (locked out of the budget, never re-bet) | $4.59 |
 | Copies that never filled (FAK zero-fills, $0 moved, auto-refunded) | 4 |
 <!-- /results:auto -->
 
@@ -205,9 +205,10 @@ losing week faithfully delivered the loss the model predicted. The mechanism
 is sound; what it cannot do is make a $46 bankroll feel like his: at 19 copies
 per trader-week, one correlated in-play basket (seven legs on a single match)
 swings a fifth of the bankroll at once. That's a variance problem, not an
-edge problem — and it's the argument for a per-match exposure cap, the next
-gate on the list. Sample sizes are tiny; treat the decimals as illustration,
-the signs as evidence.
+edge problem — and it's the argument for a per-match exposure cap, which
+**shipped** as the per-event legs cap (`MAX_LEGS_PER_EVENT`, default 2,
+configurable, 0 = off). Sample sizes are tiny; treat the decimals as
+illustration, the signs as evidence.
 
 ### Stage 1 — survival screens
 
@@ -355,8 +356,9 @@ covariance:
 so m fully-correlated legs behave like **one bet of m-fold size** — the √m of
 apparent diversification is fictitious. The Argentina–Egypt night measured
 this live: seven legs, ~$24 at risk, −$16 gross in a single game — 36% of the
-run's entire loss column. The fix is a per-match exposure cap (the next gate
-planned), which attacks ρ directly instead of anyone's edge.
+run's entire loss column. The fix is a per-match exposure cap — **shipped** as
+`MAX_LEGS_PER_EVENT` (default 2), which caps open legs sharing a match/event
+key and attacks ρ directly instead of anyone's edge.
 
 **Breakeven check against realized results.** Copies entered at mean price
 p̄ = 0.57 (median 0.61, n = 55). A binary position bought at p̄ and held to
@@ -672,11 +674,11 @@ someone's luck.
 ## Features
 
 - **Real-time copying** — WebSocket stream of platform trades (sub-second reaction), REST polling as reconciliation + fallback, per-trade dedupe across both paths
-- **Risk gates on every copy** — no stacking (one position per market regardless of how many fills the target sprays), no chasing (skips if the price ran past the target's fill + slippage), horizon cap (skip markets resolving beyond N days — fail-closed: a missing or stale-past end date refuses to copy while the cap is armed, with a 1-day grace for in-play overtime), failed-buy cooldown
+- **Risk gates on every copy** — no stacking (one position per market regardless of how many fills the target sprays), no chasing (skips if the price ran past the target's fill + slippage), horizon cap (skip markets resolving beyond N days — fail-closed: a missing or stale-past end date refuses to copy while the cap is armed, with a 1-day grace for in-play overtime), per-event legs cap (`MAX_LEGS_PER_EVENT`, default 2 — correlated same-match legs behave like one bet at m× size), failed-buy cooldown
 - **Auto-budget** — spend cap follows the wallet (total − reserve) and per-trade size scales with it, so the bot breathes with wins and losses without manual bumps
 - **Per-trader Kelly sizing + horizon** — each roster entry can carry its own measured net edge (scout adds arm it automatically with the pipeline's pessimistic estimate) and its own days-out cap; the Kelly rule f\*(p)=ê·p/(1−p) then stakes more where the measured edge is stronger
 - **Investment panel + profit banking** — set your cost basis and the dashboard shows live return vs invested and your all-time high; above a profit hurdle (default +20% over basis) a configurable slice of new-high gains is locked out of the budget (never re-bet), so peaks survive the next drawdown without choking compounding near breakeven. Top-ups are auto-detected on-chain (plain `transfer()` sends only — exchange settlements route through Polymarket's contracts and can't masquerade as deposits) and move the basis and hurdle with them. Withdrawals stay on polymarket.com — your custody; the bot still contains zero transfer code
-- **Auto take-profit** — open positions are market-sold when the mid reaches 0.95 (near-certainty: the last cents aren't worth in-play reversal risk) or gains 120% over entry (both configurable, 0 = off) — the rode-to-$88-and-round-tripped failure mode gets *realized* instead of just marked
+- **Auto take-profit** — open positions are market-sold when the **best bid** reaches 0.95 (near-certainty: the last cents aren't worth in-play reversal risk) or gains 120% over entry (both configurable, 0 = off) — priced off the real bid because a sell fills into bids, not the midpoint (a phantom thin-book mid spike can't trigger a dump; mid is only a book-outage fallback). The rode-to-$88-and-round-tripped failure mode gets *realized* instead of just marked
 - **Light & dark themes** — CSS-variable UI with a one-click toggle, follows your OS preference by default
 - **Chain-level reconciliation** — detects zero-filled FAK orders and auto-swept resolved positions by reading balances and the Conditional Tokens payout vector straight from Polygon, so the ledger stays true even when every Polymarket API is blind (negRisk markets)
 - **Multi-trader with attribution** — every copy, skip and log line names which target it came from
@@ -757,10 +759,13 @@ any release.
   which only *reads* transfers, never makes one). The worst-case blast radius
   of a bug is *bad trades within the budget caps*, not exfiltrated funds.
 
-**Bounded egress.** The complete list of hosts the bot ever contacts:
-`*.polymarket.com` (data, gamma, lb, user-pnl, CLOB REST + WebSocket) and two
-public Polygon RPCs (`publicnode.com`, `polygon-rpc.com`) for read-only chain
-queries. No telemetry, no analytics, no third parties.
+**Bounded egress.** In the trading path the complete list of hosts the bot ever
+contacts: `*.polymarket.com` (data, gamma, lb, user-pnl, CLOB REST + WebSocket)
+and two public Polygon RPCs (`publicnode.com`, `polygon-rpc.com`) for read-only
+chain queries. No telemetry, no analytics, no third parties. Two disclosed
+exceptions, both outside the trading path and each tied to a subprocess listed
+below: `pip` reaches PyPI only when the dependency self-heal installs a missing
+module, and the `claude` CLI reaches Anthropic only when you use the copilot.
 
 **Bounded blast radius by construction.**
 - HTTP UI binds to `127.0.0.1` only — nothing is exposed to the network
