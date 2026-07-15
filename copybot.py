@@ -135,8 +135,40 @@ def check_deps(log=True):
     STATE["missing_deps"] = missing
     if missing and log:
         logline(kind="error", note="missing modules: " + ", ".join(missing)
-                + " — run: pip install " + " ".join(missing) + " , then relaunch")
+                + " — self-installing with the bot's own Python (no action needed); "
+                + "manual fallback: pip install " + " ".join(missing))
     return missing
+
+
+DEP_HEAL_AT = 0.0  # next time the pip self-heal may run (rate-limited)
+
+
+def auto_heal_deps(missing):
+    """Install missing runtime modules with THE BOT'S OWN interpreter
+    (sys.executable -m pip): manual installs kept landing in the wrong Python
+    on this machine, and a typo ('py-clib-…') costs real downtime. Fixed argv,
+    no shell — same discipline as the copilot subprocess. Rate-limited to one
+    attempt per half hour; a no-op inside the frozen exe (it has no pip).
+    Runs pip in a background thread; the bot_loop recovery re-check re-arms
+    the websocket and live trading once the imports actually work again."""
+    global DEP_HEAL_AT
+    if not missing or getattr(sys, "frozen", False) or time.time() < DEP_HEAL_AT:
+        return False
+    DEP_HEAL_AT = time.time() + 1800
+    logline(kind="live", note="dep self-heal: installing " + " ".join(missing) + " …")
+
+    def run():
+        try:
+            r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", *missing],
+                               capture_output=True, timeout=600)
+            note = ("dep self-heal: pip finished OK — modules re-checked within a poll"
+                    if r.returncode == 0 else
+                    f"dep self-heal: pip exited {r.returncode} — retrying in 30 min")
+        except Exception as ex:
+            note = f"dep self-heal could not run pip: {str(ex)[:80]}"
+        logline(kind="live" if "OK" in note else "error", note=note)
+    threading.Thread(target=run, daemon=True).start()
+    return True
 
 
 # ---- pure logic (unit-tested in _check) -------------------------------------
@@ -1671,6 +1703,8 @@ def bot_loop():
     try_go_live("startup")
     polls = 0
     while True:
+        if STATE["missing_deps"]:
+            auto_heal_deps(STATE["missing_deps"])  # async pip; recovery below re-arms
         if STATE["missing_deps"] and not check_deps(log=False):
             # environment healed (pip finished / lock released): restart the realtime
             # thread (its import failed once and it exited) and re-arm via auto-live
@@ -3270,6 +3304,36 @@ def _check():
     # a transient import failure heals: the quiet re-check clears the flag
     # (all deps exist in the test env), which is what lets bot_loop re-arm
     assert check_deps(log=False) == [] and STATE["missing_deps"] == []
+    # dep self-heal: pip runs with THIS interpreter, fixed argv, rate-limited,
+    # and never inside the frozen exe
+    _pip_calls = []
+
+    class _SP:
+        @staticmethod
+        def run(argv, capture_output=True, timeout=0):
+            _pip_calls.append(list(argv))
+
+            class R:
+                returncode = 0
+            return R()
+    _osp3 = subprocess
+    globals()["subprocess"] = _SP
+    globals()["DEP_HEAL_AT"] = 0.0
+    assert auto_heal_deps(["websocket-client", "regex"]) is True
+    for _ in range(100):
+        if _pip_calls:
+            break
+        time.sleep(0.01)
+    assert _pip_calls and _pip_calls[0][:5] == [sys.executable, "-m", "pip", "install", "--quiet"]
+    assert _pip_calls[0][5:] == ["websocket-client", "regex"]
+    assert auto_heal_deps(["regex"]) is False       # half-hour cooldown holds
+    globals()["DEP_HEAL_AT"] = 0.0
+    sys.frozen = True
+    assert auto_heal_deps(["regex"]) is False       # packaged exe has no pip
+    del sys.frozen
+    assert auto_heal_deps([]) is False              # nothing missing → no-op
+    globals()["subprocess"] = _osp3
+    globals()["DEP_HEAL_AT"] = time.time() + 3600   # keep the suite from real pip runs
     # chat persistence round-trips through disk
     chat_add("you", "does the chat save?")
     STATE["chat"].clear()

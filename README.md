@@ -771,8 +771,10 @@ queries. No telemetry, no analytics, no third parties.
   the bot itself bought, clamped to the actual on-chain balance
 - the Claude copilot tunes settings through a whitelisted action protocol; it
   cannot place trades and its context snapshot excludes the key
-- one subprocess exists in the whole file: the copilot's `claude -p` call —
-  fixed argv, no shell
+- exactly two subprocesses exist in the whole file, both fixed argv, no shell:
+  the copilot's `claude -p` call, and the dependency self-heal's
+  `python -m pip install <its own pinned module list>` (runs with the bot's
+  own interpreter, rate-limited, absent from the packaged exe)
 
 **And the boundary that actually matters:** run it on a dedicated wallet that
 only ever holds your bankroll. Software guarantees end where key custody
